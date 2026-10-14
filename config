@@ -1,0 +1,85 @@
+# ngx_http_scheme_module -- config script for the traditional nginx build:
+#
+#   SCHEME_CORE_DIR=/path/to/dummy \
+#       ./configure --add-module=path/to/nginx-module
+#
+# The scheme interpreter core (vm.cpp & friends) is a dependency that lives
+# outside this module, in the host project, so its location cannot be guessed
+# and must be provided explicitly via the SCHEME_CORE_DIR environment
+# variable (the standard way to parameterise an nginx add-on; same pattern
+# as LUAJIT_LIB/LUAJIT_INC for the lua module).  Configure fails early with
+# a clear message if it is missing or does not contain the expected sources.
+#
+# The CMake build under nginx-module/ is the primary, recommended path
+# (it produces both Unix Makefiles and an Xcode project); it passes
+# SCHEME_CORE_DIR through automatically.  This file keeps the module
+# installable through plain nginx ./configure as well.
+#
+# Note: the interpreter is C++.  nginx's build compiles .cpp addon sources
+# with the configured $(CC) driver, which dispatches on the extension, and
+# we append the C++ standard library to CORE_LIBS below.
+
+ngx_addon_name=ngx_http_scheme_module
+
+SCHEME_CORE_DIR=${SCHEME_CORE_DIR:-}
+if [ -z "$SCHEME_CORE_DIR" ]; then
+    cat <<END
+$0: error: ngx_http_scheme_module requires the scheme interpreter core
+(host project root), but SCHEME_CORE_DIR is not set.  Point it at the
+directory containing vm.cpp and friends, e.g.
+
+    SCHEME_CORE_DIR=/path/to/dummy ./configure --add-module=path/to/nginx-module
+
+END
+    exit 1
+fi
+if [ ! -f "$SCHEME_CORE_DIR/vm.cpp" ]; then
+    cat <<END
+$0: error: SCHEME_CORE_DIR=$SCHEME_CORE_DIR does not contain vm.cpp
+(is it the host project root?)
+END
+    exit 1
+fi
+
+SCHEME_CORE_SRCS=" \
+    $SCHEME_CORE_DIR/vm.cpp \
+    $SCHEME_CORE_DIR/scmapi.cpp \
+    $SCHEME_CORE_DIR/scmbasic.cpp \
+    $SCHEME_CORE_DIR/scmmath.cpp \
+    $SCHEME_CORE_DIR/scmstring.cpp \
+    $SCHEME_CORE_DIR/scmcompiler.cpp \
+    $SCHEME_CORE_DIR/scmport.cpp \
+    $SCHEME_CORE_DIR/scmvector.cpp \
+    $SCHEME_CORE_DIR/scmtable.cpp \
+    $SCHEME_CORE_DIR/scminit.cpp \
+"
+
+HTTP_SCHEME_SRCS=" \
+    $ngx_addon_dir/src/ngx_http_scheme_module.c \
+    $ngx_addon_dir/src/ngx_scheme_runtime.cpp \
+    $SCHEME_CORE_SRCS \
+"
+
+HTTP_SCHEME_DEPS=" \
+    $ngx_addon_dir/src/ngx_http_scheme_module.c \
+    $ngx_addon_dir/src/ngx_scheme_runtime.h \
+    $ngx_addon_dir/src/ngx_scheme_runtime.cpp \
+    $SCHEME_CORE_SRCS \
+"
+
+HTTP_MODULES="$HTTP_MODULES ngx_http_scheme_module"
+NGX_ADDON_SRCS="$NGX_ADDON_SRCS $HTTP_SCHEME_SRCS"
+NGX_ADDON_DEPS="$NGX_ADDON_DEPS $HTTP_SCHEME_DEPS"
+
+CORE_INCS="$CORE_INCS $SCHEME_CORE_DIR $ngx_addon_dir/src"
+
+# C++ runtime for the scheme core.  There is no single "C++ standard
+# library": it is a different library per toolchain -- Apple's libc++ on
+# Darwin, GCC's libstdc++ on Linux -- and linking the C++ objects requires
+# the matching one, so the branch below is the cross-platform handling, not
+# a macOS special case.  nginx's $(CC) C driver never pulls the C++ runtime
+# in on its own, hence the explicit -l flag on every platform.
+case "$NGX_PLATFORM" in
+    Darwin:*) CORE_LIBS="$CORE_LIBS -lc++" ;;
+    *)        CORE_LIBS="$CORE_LIBS -lstdc++" ;;
+esac
