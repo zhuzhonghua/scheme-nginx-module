@@ -1,28 +1,103 @@
 /*
  * ngx_scheme_runtime.cpp -- C bridge over the dummyscheme VM.
  *
- * Owns one VM per request.  The default output port of the VM is replaced
- * by an OutputPortStrObj so that everything the scheme code prints via
- * `display` / `write` / `newline` is accumulated into an in-memory buffer
- * instead of going to stderr, and can be handed back to nginx as the
- * response body.
+ * Owns one VM per request.  Output follows the model :
+ * the scheme code calls the host function `ngx-say` to hand strings to
+ * nginx, which appends them to a per-request buffer and sends that buffer as
+ * the response body.  The VM's own IO streams (display/write -> stderr) are
+ * never touched.
  *
- * The default output port normally points at stderr (see GlobalVM::init
- * in vm.cpp); we swap in a string port right after VM creation.
+ * The request handle is stored in the VM's registry as a lightuserdata
+ * (scm_registry_set + scm_make_lightuserdata), a host function finds its
+ * context via scm_registry_get + scm_to_lightuserdata. The response buffer
+ * is owned by this handle (plain growing buffer); the final body is copied into the nginx
+ * request pool by the content handler.
+ *
+ * This file talks to the interpreter through the public API (vm.h, which
+ * includes scmapi.h) only.
  */
 #include "vm.h"
 #include "ngx_scheme_runtime.h"
 
 #include <stdlib.h>
 #include <stdio.h>
-#include <stdio.h>
 #include <string.h>
 
 using namespace Scheme;
 
+/* registry key holding this request's handle (a lightuserdata) */
+#define NGX_SCHEME_CTX_KEY "~ngx-scheme-ctx"
+
 struct ngx_scheme_vm_s {
-    VM                *vm;     /* the interpreter */
-    OutputPortStrObj  *oport;  /* string output port; rooted via G(vm)->oport */
+  VM    *vm;   /* the interpreter (created via scm_create_vm) */
+  char  *buf;  /* growing response buffer (owned by this handle) */
+  int    len;  /* used bytes */
+  int    cap;  /* allocated bytes */
+};
+
+static void ngx_scheme_append(ngx_scheme_vm_s *h, const char *s, int n);
+
+static void
+ngx_scheme_append(ngx_scheme_vm_s *h, const char *s, int n)
+{
+  if (n <= 0) {
+    return;
+  }
+
+  if (h->len + n > h->cap) {
+    int ncap = h->cap ? h->cap * 2 : 256;
+    while (ncap < h->len + n) {
+      ncap *= 2;
+    }
+    char *nb = (char *) realloc(h->buf, ncap);
+    if (nb == NULL) {
+      throw "OutOfMemory";
+    }
+    h->buf = nb;
+    h->cap = ncap;
+  }
+
+  memcpy(h->buf + h->len, s, n);
+  h->len += n;
+}
+
+/*
+ * The ngx-say host function: converts every argument to a string and appends
+ * it to the request's output buffer.  Strings are appended verbatim (display
+ * semantics, like Lua's tostring); any other value is printed with
+ * write semantics.  Accepts any number of arguments.
+ */
+static ValueT
+ngx_scheme_say(VM* vm, ValueT* rest)
+{
+  ValueT ctx = scm_registry_get(vm, NGX_SCHEME_CTX_KEY);
+  if (!scm_is_lightuserdata(vm, &ctx)) {
+    throw "no request context";
+  }
+  ngx_scheme_vm_s *h = (ngx_scheme_vm_s *) scm_to_lightuserdata(vm, &ctx);
+
+  while (!scm_is_null(vm, rest)) {
+    ValueT *p = scm_car(vm, rest);
+    if (scm_is_string(vm, p)) {
+      int n = 0;
+      const char *s = scm_get_string(vm, p, &n);
+      ngx_scheme_append(h, s, n);
+    }
+    else {
+      int n = 0;
+      const char *s = scm_tostring(vm, p, &n);
+      ngx_scheme_append(h, s, n);
+    }
+    rest = scm_cdr(vm, rest);
+  }
+
+  return_void();
+}
+
+/* library table, same style as the builtin ones (see SCMMath::init) */
+static const RegCProc ngx_scheme_lib[] = {
+  RegCProc("ngx-say", ngx_scheme_say, true),  /* variadic */
+  RegCProc(NULL, -1)
 };
 
 ngx_scheme_vm_t *
@@ -34,7 +109,9 @@ ngx_scheme_create(void)
     }
 
     h->vm = NULL;
-    h->oport = NULL;
+  h->buf = NULL;
+  h->len = 0;
+  h->cap = 0;
 
     try {
         h->vm = scm_create_vm();
@@ -43,9 +120,11 @@ ngx_scheme_create(void)
             return NULL;
         }
 
-        /* redirect display/write output into a string buffer */
-        h->oport = Sr1(h->vm, OutputPortStrObj, h->vm);
-        G(h->vm)->oport = h->oport;
+    /* register this handle as a lightuserdata in the VM registry, like
+        lua-nginx-module's request context in the Lua registry */
+    scm_registry_set(h->vm, NGX_SCHEME_CTX_KEY,
+        scm_make_lightuserdata(h->vm, h));
+    scm_register_lib(h->vm, ngx_scheme_lib);
     }
     catch (...) {
         if (h->vm != NULL) {
@@ -58,32 +137,50 @@ ngx_scheme_create(void)
     return h;
 }
 
-void
-ngx_scheme_destroy(ngx_scheme_vm_t *h)
+int
+ngx_scheme_destroy(ngx_scheme_vm_t *h, char *err, int err_cap)
 {
+  if (err_cap > 0) {
+    err[0] = '\0';
+  }
     if (h == NULL) {
-        return;
+    return 0;  /* nothing owned, nothing to tear down */
     }
 
     if (h->vm != NULL) {
         try {
             scm_destroy_vm(h->vm);
         }
+    catch (const char *e) {
+      /* teardown must not throw out of the request path, but the failure
+          is reported to the caller, which logs it (this bridge never logs) */
+      if (err_cap > 0) {
+        snprintf(err, err_cap, "scheme teardown error: %s",
+            e != NULL ? e : "unknown");
+      }
+      free(h->buf);
+      free(h);
+      return -1;
+    }
         catch (...) {
-            /* teardown must not throw out of the request path */
+      if (err_cap > 0) {
+        snprintf(err, err_cap, "scheme teardown error: unknown exception");
+      }
+      free(h->buf);
+      free(h);
+      return -1;
         }
     }
 
+  free(h->buf);
     free(h);
+  return 0;
 }
 
 int
 ngx_scheme_eval(ngx_scheme_vm_t *h, const char *code, int len,
                 char *err, int err_cap)
 {
-    char *src;
-    ValueT res;
-
     if (h == NULL || h->vm == NULL) {
         return -1;
     }
@@ -92,45 +189,23 @@ ngx_scheme_eval(ngx_scheme_vm_t *h, const char *code, int len,
         err[0] = '\0';
     }
 
-    /* evalstr() needs a NUL-terminated source string */
-    src = (char *) malloc((size_t) len + 1);
-    if (src == NULL) {
-        if (err_cap > 0) {
-            snprintf(err, err_cap, "out of memory");
-        }
-        return -1;
-    }
-    memcpy(src, code, (size_t) len);
-    src[len] = '\0';
-
-    h->oport->strbuf.reset();
-
     try {
-        res = h->vm->evalstr(src);
-
-        /* a string as the value of the last expression is appended too */
-        if (isstr(&res)) {
-            StrPtr sp = strref(&res);
-            h->oport->writestr(Ssstr(sp), Sslen(sp));
-        }
+    (void) scm_eval_string(h->vm, code, len);
     }
     catch (const char *e) {
         if (err_cap > 0) {
             snprintf(err, err_cap, "scheme error: %s",
                      e != NULL ? e : "unknown");
         }
-        free(src);
         return -1;
     }
     catch (...) {
         if (err_cap > 0) {
             snprintf(err, err_cap, "scheme error: unknown exception");
         }
-        free(src);
         return -1;
     }
 
-    free(src);
     return 0;
 }
 
@@ -144,14 +219,14 @@ ngx_scheme_output(ngx_scheme_vm_t *h, const char **data, int *len)
         *len = 0;
     }
 
-    if (h == NULL || h->oport == NULL) {
+  if (h == NULL) {
         return;
     }
 
     if (data != NULL) {
-        *data = h->oport->strbuf.buf;
+    *data = h->buf;
     }
     if (len != NULL) {
-        *len = h->oport->strbuf.count;
+    *len = h->len;
     }
 }

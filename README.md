@@ -2,7 +2,7 @@
 
 Run Scheme inside nginx like lua-nginx-module.  The module embeds the [dummyscheme](https://github.com/zhuzhonghua/dummyscheme)
 and exposes a `content_by_scheme` directive that evaluates
-inline Scheme source and sends the `display` output as the response body.
+inline Scheme source and sends the response body via the host function `ngx-say`.
 
 The module follows the classic nginx content-module layout (module struct +
 commands array + create/merge loc_conf + content handler).  It is a generic
@@ -21,25 +21,26 @@ make
 
 The module adds one directive, `content_by_scheme`, valid inside
 `location` blocks.  It takes a single inline Scheme expression as an
-argument and is used as the content handler of that location:
+argument and is used as the content handler of that location.  The scheme
+code produces the body by calling `(ngx-say ...)`, which converts each
+argument to a string (write semantics) and appends it to the response:
 
 ```nginx
 server {
     listen 8080;
 
     location /hello {
-        content_by_scheme '(begin (display "hello ") (display (+ 20 22)))';
+        content_by_scheme '(ngx-say "hello " (+ 20 22))';
     }
 
     location /sum {
-        content_by_scheme '(begin (display "sum=") (number->string (+ 40 2)))';
+        content_by_scheme '(ngx-say "sum=" (+ 40 2))';
     }
 
     location /fib {
-        content_by_scheme '(begin (display "fib(24)=")
-                                  (display
+        content_by_scheme '(ngx-say "fib(24)="
                                     (let fib ((n 24))
-                                      (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))))';
+                                      (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))))';
     }
 }
 ```
@@ -49,3 +50,6 @@ curl http://127.0.0.1:8080/hello   # -> hello 42
 curl http://127.0.0.1:8080/sum     # -> sum=42
 curl http://127.0.0.1:8080/fib     # -> fib(24)=46368
 ```
+
+Note that `display` / `write` go to the VM's default output (stderr), not
+into the body; use `ngx-say` for response output.

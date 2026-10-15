@@ -11,7 +11,7 @@
  * Example:
  *
  *   location /hello {
- *       content_by_scheme '(begin (display "hello ") (display (+ 20 22)))';
+ *       content_by_scheme '(ngx-say "hello " (+ 20 22))';
  *   }
  *   # GET /hello -> "hello 42"
  */
@@ -126,6 +126,21 @@ ngx_http_scheme_content_by_scheme(ngx_conf_t *cf, ngx_command_t *cmd,
     return NGX_CONF_OK;
 }
 
+/*
+ * Destroy the per-request VM and log teardown failures here, in the nginx
+ * layer: the C++ bridge never logs (it has no nginx dependency), it only
+ * reports errors through its return code and error buffer.
+ */
+static void
+ngx_http_scheme_destroy(ngx_scheme_vm_t *svm, ngx_http_request_t *r)
+{
+  char err[128];
+
+  if (ngx_scheme_destroy(svm, err, sizeof(err)) != 0) {
+    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "scheme: %s", err);
+  }
+}
+
 static ngx_int_t
 ngx_http_scheme_handler(ngx_http_request_t *r)
 {
@@ -155,7 +170,7 @@ ngx_http_scheme_handler(ngx_http_request_t *r)
                         err, sizeof(err)) != 0)
     {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "scheme: %s", err);
-        ngx_scheme_destroy(svm);
+    ngx_http_scheme_destroy(svm, r);
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
@@ -171,13 +186,13 @@ ngx_http_scheme_handler(ngx_http_request_t *r)
 
     rc = ngx_http_send_header(r);
     if (rc == NGX_ERROR || rc > NGX_OK || r->header_only) {
-        ngx_scheme_destroy(svm);
+    ngx_http_scheme_destroy(svm, r);
         return rc;
     }
 
     b = ngx_create_temp_buf(r->pool, (size_t) body_len);
     if (b == NULL) {
-        ngx_scheme_destroy(svm);
+    ngx_http_scheme_destroy(svm, r);
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
     if (body_len > 0) {
@@ -194,14 +209,14 @@ ngx_http_scheme_handler(ngx_http_request_t *r)
 
     cl = ngx_alloc_chain_link(r->pool);
     if (cl == NULL) {
-        ngx_scheme_destroy(svm);
+    ngx_http_scheme_destroy(svm, r);
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
     cl->buf = b;
     cl->next = NULL;
 
-    ngx_scheme_destroy(svm);
+  ngx_http_scheme_destroy(svm, r);
 
     return ngx_http_output_filter(r, cl);
 }
