@@ -11,10 +11,9 @@
  * Output model: the scheme code sends the response body by calling the host
  * function `ngx-say` (registered into the VM at creation), which converts
  * each argument to a string and appends it to an output buffer owned by this
- * handle -- the same model as lua-nginx-module's ngx-say.  The VM's own IO
- * streams (display/write -> stderr) are never touched.  The handle is stored
- * in the VM's registry as a lightuserdata, and the response buffer is a
- * plain growing buffer owned by this handle.
+ * handle.  The VM's own IO streams (display/write -> stderr) are never
+ * touched.  The handle is stored in the VM's registry as a lightuserdata,
+ * and the response buffer is a plain growing buffer owned by this handle.
  *
  * Lifetime model (MVP): one VM is created per request and destroyed when
  * the request finishes.  A worker may run many requests concurrently and
@@ -24,6 +23,18 @@
 #ifndef NGX_SCHEME_RUNTIME_H
 #define NGX_SCHEME_RUNTIME_H
 
+/* nginx types/macros (ngx_log_t, NGX_LOG_*); the extern "C" wrapper only
+ * applies in C++ so the declarations get C linkage there (plain C needs no
+ * wrapper) */
+#ifdef __cplusplus
+extern "C" {
+#endif
+#include <ngx_config.h>
+#include <ngx_core.h>
+#ifdef __cplusplus
+}
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -31,16 +42,18 @@ extern "C" {
 /* opaque per-request scheme VM handle */
 typedef struct ngx_scheme_vm_s ngx_scheme_vm_t;
 
-/* create a fresh scheme VM; returns NULL on failure */
-ngx_scheme_vm_t *ngx_scheme_create(void);
+/*
+ * Create a fresh scheme VM.  `log` is the nginx error log that the ngx-log
+ * host function writes to; returns NULL on failure.
+ */
+ngx_scheme_vm_t *ngx_scheme_create(ngx_log_t *log);
 
 /*
  * Destroy the VM and release every resource it owns.
  *
  * Returns 0 on success.  On a teardown failure returns -1 and writes a
  * NUL-terminated message into err/err_cap (if err_cap > 0), so the caller
- * can log it -- the bridge itself never logs, nginx logging stays in the
- * C module layer (same contract as ngx_scheme_eval).
+ * can log it.
  */
 int ngx_scheme_destroy(ngx_scheme_vm_t *vm, char *err, int err_cap);
 

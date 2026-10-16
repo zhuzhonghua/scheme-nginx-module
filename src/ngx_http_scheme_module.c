@@ -128,8 +128,8 @@ ngx_http_scheme_content_by_scheme(ngx_conf_t *cf, ngx_command_t *cmd,
 
 /*
  * Destroy the per-request VM and log teardown failures here, in the nginx
- * layer: the C++ bridge never logs (it has no nginx dependency), it only
- * reports errors through its return code and error buffer.
+ * layer: the bridge reports teardown errors through its return code and
+ * error buffer.
  */
 static void
 ngx_http_scheme_destroy(ngx_scheme_vm_t *svm, ngx_http_request_t *r)
@@ -137,7 +137,7 @@ ngx_http_scheme_destroy(ngx_scheme_vm_t *svm, ngx_http_request_t *r)
   char err[128];
 
   if (ngx_scheme_destroy(svm, err, sizeof(err)) != 0) {
-    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "scheme: %s", err);
+    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "[scheme]: %s", err);
   }
 }
 
@@ -159,17 +159,17 @@ ngx_http_scheme_handler(ngx_http_request_t *r)
     return NGX_DECLINED;
   }
 
-  svm = ngx_scheme_create();
+  svm = ngx_scheme_create(r->connection->log);
   if (svm == NULL) {
     ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-        "scheme: failed to create VM");
+        "[scheme]: failed to create VM");
     return NGX_HTTP_INTERNAL_SERVER_ERROR;
   }
 
   if (ngx_scheme_eval(svm, (const char *) slcf->code.data, slcf->code.len,
           err, sizeof(err)) != 0)
   {
-    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "scheme: %s", err);
+    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "[scheme]: %s", err);
     ngx_http_scheme_destroy(svm, r);
     return NGX_HTTP_INTERNAL_SERVER_ERROR;
   }
@@ -177,7 +177,7 @@ ngx_http_scheme_handler(ngx_http_request_t *r)
   ngx_scheme_output(svm, &body, &body_len);
 
   ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-      "scheme: body %d bytes", body_len);
+      "[scheme]: body %d bytes", body_len);
 
   ngx_str_set(&r->headers_out.content_type, "text/plain");
   r->headers_out.content_type_len = sizeof("text/plain") - 1;
