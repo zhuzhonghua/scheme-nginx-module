@@ -192,6 +192,31 @@ static const RegCProc ngx_scheme_lib[] = {
   RegCProc(NULL, -1)
 };
 
+/* Register the log-level constants as top-level variables (ngx-err etc.). */
+static void
+ngx_scheme_inject_log_consts(VM *vm)
+{
+  static const struct {
+    const char *name;
+    ngx_uint_t  level;
+  } log_levels[] = {
+    { "ngx-stderr", NGX_LOG_STDERR },
+    { "ngx-emerg",  NGX_LOG_EMERG  },
+    { "ngx-alert",  NGX_LOG_ALERT  },
+    { "ngx-crit",   NGX_LOG_CRIT   },
+    { "ngx-err",    NGX_LOG_ERR    },
+    { "ngx-warn",   NGX_LOG_WARN   },
+    { "ngx-notice", NGX_LOG_NOTICE },
+    { "ngx-info",   NGX_LOG_INFO   },
+    { "ngx-debug",  NGX_LOG_DEBUG  },
+  };
+
+  for (int i = 0; i < (int) (sizeof(log_levels) / sizeof(log_levels[0])); i++) {
+    scm_set_global(vm, log_levels[i].name,
+        scm_make_int(vm, (scm_int) log_levels[i].level));
+  }
+}
+
 ngx_scheme_vm_t *
 ngx_scheme_create(ngx_log_t *log)
 {
@@ -217,6 +242,7 @@ ngx_scheme_create(ngx_log_t *log)
     scm_registry_set(h->vm, NGX_SCHEME_CTX_KEY,
         scm_make_lightuserdata(h->vm, h));
     scm_register_lib(h->vm, ngx_scheme_lib);
+    ngx_scheme_inject_log_consts(h->vm);
   }
   catch (...) {
     if (h->vm != NULL) {
