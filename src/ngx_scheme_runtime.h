@@ -55,7 +55,7 @@ int ngx_scheme_destroy(ngx_scheme_vm_t *vm, char *err, int err_cap);
  * NUL-terminated message into err/err_cap (if err_cap > 0).
  */
 int ngx_scheme_eval(ngx_scheme_vm_t *vm, const char *code, int len,
-                    char *err, int err_cap);
+          char *err, int err_cap);
 
 /*
  * After a successful ngx_scheme_eval(): pointer + length of the body
