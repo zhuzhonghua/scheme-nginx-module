@@ -184,6 +184,17 @@ ngx_http_scheme_handler(ngx_http_request_t *r)
   r->headers_out.status = NGX_HTTP_OK;
   r->headers_out.content_length_n = body_len;
 
+  if (body_len == 0) {
+    /*
+     * empty body (e.g. bare (ngx-say)): mark the response header-only so
+     * no zero-size buf reaches the write filter -- nginx treats a buf
+     * with pos == last as an error ("zero size buf in writer").
+     */
+    r->header_only = 1;
+    ngx_http_scheme_destroy(svm, r);
+    return ngx_http_send_header(r);
+  }
+
   rc = ngx_http_send_header(r);
   if (rc == NGX_ERROR || rc > NGX_OK || r->header_only) {
     ngx_http_scheme_destroy(svm, r);
@@ -195,9 +206,7 @@ ngx_http_scheme_handler(ngx_http_request_t *r)
     ngx_http_scheme_destroy(svm, r);
     return NGX_HTTP_INTERNAL_SERVER_ERROR;
   }
-  if (body_len > 0) {
     b->last = ngx_cpymem(b->pos, body, (size_t) body_len);
-  }
 
   /*
   * this is the final buffer of the response: mark it so the write
