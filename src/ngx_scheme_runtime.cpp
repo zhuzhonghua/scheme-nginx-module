@@ -28,6 +28,9 @@ using namespace Scheme;
 /* registry key holding this request's handle (a lightuserdata) */
 #define NGX_SCHEME_CTX_KEY "~ngx-scheme-ctx"
 
+/* registry key buffer for per-location cached values ("~code-%p" / "~env-%p") */
+#define NGX_SCHEME_CACHE_KEY_LEN 64
+
 /* growing byte buffer; used for the response body and for assembling
  * ngx-log messages */
 struct ngx_scheme_buf_s {
@@ -529,7 +532,28 @@ ngx_scheme_eval(ngx_scheme_vm_t *h, const char *code, int len,
   }
 
   try {
-    (void) scm_eval_string(h->vm, code, len);
+    /* compile once per location script and cache the closure in the registry
+       for the VM's lifetime; requests just apply the cached closure */
+    char key[NGX_SCHEME_CACHE_KEY_LEN] = {0};
+    snprintf(key, sizeof(key), "~code-%p", (const void *) code);
+
+    Sgcvar1(h->vm, fv);
+    *fv = scm_registry_get(h->vm, key);
+    if (scm_is_null(h->vm, fv)) {
+      *fv = scm_compile(h->vm, code, len);
+      scm_registry_set(h->vm, key, *fv);
+    }
+
+    ValueT result;
+    if (!scm_apply(h->vm, fv, NULL, 0, &result)) {
+      /* scm_apply reports a scheme error as the result string */
+      if (err_cap > 0) {
+        int n = 0;
+        const char *msg = scm_get_string(h->vm, &result, &n);
+        snprintf(err, err_cap, "scheme error: %s", msg != NULL ? msg : "unknown");
+      }
+      return -1;
+    }
   }
   catch (const ngx_scheme_exit_signal &e) {
     /* (ngx-exit N) aborted the script; that is not an error.  Statuses >= 300
