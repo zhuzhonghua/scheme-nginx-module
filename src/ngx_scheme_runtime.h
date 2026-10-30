@@ -15,10 +15,11 @@
  * touched.  The handle is stored in the VM's registry as a lightuserdata,
  * and the response buffer is a plain growing buffer owned by this handle.
  *
- * Status model: `(ngx-status-set N)` records a response status without
- * stopping the script; `(ngx-exit N)` records it and aborts the evaluation.
- * The nginx layer reads both through ngx_scheme_status() /
- * ngx_scheme_exited() after ngx_scheme_eval() returns.
+ * Request model: the handle is bound to the nginx request it serves, and the
+ * host functions read/write nginx's own request state directly (e.g. the
+ * response status lives in r->headers_out.status).  The handle therefore
+ * carries no per-feature fields: adding a new ngx-* function normally means
+ * touching only that function, not the handle or the C API.
  *
  * Lifetime model (MVP): one VM is created per request and destroyed when
  * the request finishes.  A worker may run many requests concurrently and
@@ -28,14 +29,15 @@
 #ifndef NGX_SCHEME_RUNTIME_H
 #define NGX_SCHEME_RUNTIME_H
 
-/* nginx types/macros (ngx_log_t, NGX_LOG_*); the extern "C" wrapper only
- * applies in C++ so the declarations get C linkage there (plain C needs no
- * wrapper) */
+/* nginx types/macros (ngx_http_request_t, ngx_log_t, NGX_LOG_*); the
+ * extern "C" wrapper only applies in C++ so the declarations get C linkage
+ * there (plain C needs no wrapper) */
 #ifdef __cplusplus
 extern "C" {
 #endif
 #include <ngx_config.h>
 #include <ngx_core.h>
+#include <ngx_http.h>
 #ifdef __cplusplus
 }
 #endif
@@ -48,10 +50,12 @@ extern "C" {
 typedef struct ngx_scheme_vm_s ngx_scheme_vm_t;
 
 /*
- * Create a fresh scheme VM.  `log` is the nginx error log that the ngx-log
- * host function writes to; returns NULL on failure.
+ * Create a fresh scheme VM bound to request `r`.  The handle keeps only the
+ * request pointer: ngx-log writes to r->connection->log, and response state
+ * (status, headers, ...) is read/written through the request itself, so new
+ * scheme functions do not add fields here.  Returns NULL on failure.
  */
-ngx_scheme_vm_t *ngx_scheme_create(ngx_log_t *log);
+ngx_scheme_vm_t *ngx_scheme_create(ngx_http_request_t *r);
 
 /*
  * Destroy the VM and release every resource it owns.
@@ -69,8 +73,15 @@ int ngx_scheme_destroy(ngx_scheme_vm_t *vm, char *err, int err_cap);
  * response body; the value of the last expression is ignored.  Call
  * ngx_scheme_output() to fetch the accumulated body.
  *
- * Returns 0 on success.  On a scheme error returns -1 and writes a
- * NUL-terminated message into err/err_cap (if err_cap > 0).
+ * Return value:
+ *   NGX_OK (0)          success; r->headers_out.status (0 = default 200),
+ *                       headers and body are already set up
+ *   NGX_ERROR (-1)      scheme error; err/err_cap holds the message
+ *   >= 300              (ngx-exit N) asked to end the request with status N;
+ *                       the caller returns N from the content handler so
+ *                       nginx emits its error page
+ * Exit statuses below 300 (including (ngx-exit 0)) return 0: the script was
+ * aborted, but the response is sent normally by the caller.
  */
 int ngx_scheme_eval(ngx_scheme_vm_t *vm, const char *code, int len,
           char *err, int err_cap);
@@ -82,21 +93,6 @@ int ngx_scheme_eval(ngx_scheme_vm_t *vm, const char *code, int len,
  * body is empty.
  */
 void ngx_scheme_output(ngx_scheme_vm_t *vm, const char **data, int *len);
-
-/*
- * Response status requested by the scheme code via `(ngx-status-set N)` or
- * `(ngx-exit N)`.  Returns the default 200 when the script left it
- * untouched.  Never returns 0.
- */
-int ngx_scheme_status(ngx_scheme_vm_t *vm);
-
-/*
- * Non-zero when `(ngx-exit ...)` aborted the script.  The nginx layer uses
- * this to decide whether the accumulated body is still meaningful: for
- * `(ngx-exit N)` with N >= 300 it hands the request back to nginx (which
- * emits its standard error page) instead of sending the body.
- */
-int ngx_scheme_exited(ngx_scheme_vm_t *vm);
 
 #ifdef __cplusplus
 }

@@ -19,8 +19,6 @@
 #include "vm.h"
 #include "ngx_scheme_runtime.h"
 
-#include <ngx_http.h>
-
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -108,19 +106,21 @@ struct ngx_scheme_buf_guard_s {
 typedef struct ngx_scheme_buf_guard_s ngx_scheme_buf_guard_t;
 
 struct ngx_scheme_vm_s {
-  VM         *vm;   /* the interpreter (created via scm_create_vm) */
-  ngx_log_t  *log;  /* nginx error log ngx-log writes to */
-  ngx_scheme_buf_t out;  /* response body accumulated via ngx-say */
-  int         status;    /* status set by (ngx-status-set)/(ngx-exit); 0 = default 200 */
-  int         exited;    /* (ngx-exit ...) was called and aborted the script */
+  VM                 *vm;   /* the interpreter (created via scm_create_vm) */
+  ngx_http_request_t *r;    /* request this VM serves; also holds the log */
+  ngx_scheme_buf_t    out;  /* response body accumulated via ngx-say */
 };
 
 /*
- * Control-flow-only exception thrown by (ngx-exit ...).  It unwinds out of
- * the interpreter's eval loop and is caught in ngx_scheme_eval(), where it
- * means "success, script aborted on purpose" rather than an error.
+ * Control-flow-only exception thrown by (ngx-exit ...).  It carries the exit
+ * status and unwinds out of the interpreter's eval loop; ngx_scheme_eval()
+ * catches it and turns it into its return value, where it means "success,
+ * script aborted on purpose" rather than an error.
  */
 struct ngx_scheme_exit_signal {
+  int status;
+
+  ngx_scheme_exit_signal(int s) : status(s) {}
 };
 
 /* resolve the request handle stored in the VM registry */
@@ -160,7 +160,7 @@ ngx_scheme_stub_log(VM* vm, ValueT* rest)
   }
 
   /* skip assembling the message when the configured level filters it out */
-  if ((ngx_uint_t) level > h->log->log_level) {
+  if ((ngx_uint_t) level > h->r->connection->log->log_level) {
     return_void();
   }
 
@@ -173,7 +173,7 @@ ngx_scheme_stub_log(VM* vm, ValueT* rest)
     ngx_scheme_buf_append_value(&msg.b, vm, scm_car(vm, rest));
     rest = scm_cdr(vm, rest);
   }
-  ngx_log_error((ngx_uint_t) level, h->log, 0, "[scheme]: %s",
+  ngx_log_error((ngx_uint_t) level, h->r->connection->log, 0, "[scheme]: %s",
       msg.b.data != NULL ? msg.b.data : "");
   return_void();
 }
@@ -197,51 +197,102 @@ ngx_scheme_stub_say(VM* vm, ValueT* rest)
   return_void();
 }
 
-/* fetch an integer HTTP status argument and range-check it (100..599) */
-static int
+/* fetch an HTTP status argument: an integer, or a string that parses as one
+ * (numeric strings are accepted); anything else raises a scheme error */
+static scm_int
 ngx_scheme_status_arg(VM *vm, ValueT *p, const char *who)
 {
-  if (!scm_is_int(vm, p)) {
-    scm_error(vm, "%s: expected integer HTTP status, got %s",
-        who, scm_typename(vm, p));
+  if (scm_is_int(vm, p)) {
+    return scm_get_int(vm, p);
   }
 
-  scm_int status = scm_get_int(vm, p);
-  if (status < 100 || status > 599) {
-    scm_error(vm, "%s: bad HTTP status: %ld", who, (long) status);
+  if (scm_is_string(vm, p)) {
+    int n = 0;
+    const char *s = scm_get_string(vm, p, &n);
+    char *end = NULL;
+    long v = strtol(s, &end, 10);
+    while (end != NULL && (*end == ' ' || *end == '\t')) {
+      end++;
+    }
+    if (end != NULL && *end == '\0' && end != s) {
+      return (scm_int) v;
+    }
   }
 
-  return (int) status;
+  scm_error(vm, "%s: expected integer HTTP status, got %s",
+      who, scm_typename(vm, p));
+  return 0;  /* not reached */
+}
+
+/* whether a metatable callback key is the symbol ngx-status */
+static bool
+ngx_scheme_is_status_key(ValueT *key)
+{
+  return issym(key) && strcmp(Ssstr(symref(key)), "ngx-status") == 0;
 }
 
 /*
- * (ngx-status-set STATUS) -- set the response status without stopping the
- * script.  The body accumulated so far is still sent, with this status.
+ * The genv metatable __index callback: ngx-status is never stored in the
+ * global table, so every read lands here and is answered from the request
+ * state (err_status first, then headers_out.status; 0 when neither is set).
+ * Any other name stays absent (the undefined value), so scripts keep the
+ * normal "undefined global var" error.
  */
 static ValueT
-ngx_scheme_stub_status_set(VM* vm, ValueT* statusp)
+ngx_scheme_stub_status_index(VM* vm, ValueT* tbl, ValueT* key)
 {
+  (void) tbl;
+
+  if (!ngx_scheme_is_status_key(key)) {
+    return *Sundefined;
+  }
+
   ngx_scheme_vm_s *h = ngx_scheme_get_ctx(vm);
-  h->status = ngx_scheme_status_arg(vm, statusp, "ngx-status-set");
+  ngx_uint_t st = h->r->err_status != 0 ? h->r->err_status
+                                        : h->r->headers_out.status;
+  return scm_make_int(vm, (scm_int) st);
+}
+
+/*
+ * The genv metatable __newindex callback: (set! ngx-status n) lands here
+ * (the name is never stored) and is written into the request at once.
+ * Numeric strings are coerced; a value that is not a number at all raises a
+ * scheme error; an out-of-range number (not 100..999) is logged and ignored
+ * without raising.  #f declines any other name, so its write takes the
+ * normal insertion path.
+ */
+static ValueT
+ngx_scheme_stub_status_newindex(VM* vm, ValueT* tbl, ValueT* key, ValueT* val)
+{
+  (void) tbl;
+
+  if (!ngx_scheme_is_status_key(key)) {
+    return scm_make_bool(vm, false);
+  }
+
+  ngx_scheme_vm_s *h = ngx_scheme_get_ctx(vm);
+  scm_int status = ngx_scheme_status_arg(vm, val, "ngx-status");
+
+  /* the status line must be 3 digits (RFC 7230 sec 3.1.2) */
+  if (status < 100 || status > 999) {
+    ngx_log_error(NGX_LOG_ERR, h->r->connection->log, 0,
+        "invalid HTTP status code %d", (int) status);
+    return_void();
+  }
+
+  h->r->headers_out.status = (ngx_uint_t) status;
+  h->r->err_status = 0;
+  h->r->headers_out.status_line.len = 0;
   return_void();
 }
 
 /*
- * (ngx-status) -- current response status; 200 when nothing has been set.
- */
-static ValueT
-ngx_scheme_stub_status(VM* vm)
-{
-  ngx_scheme_vm_s *h = ngx_scheme_get_ctx(vm);
-  return scm_make_int(vm, (scm_int) (h->status != 0 ? h->status : 200));
-}
-
-/*
- * (ngx-exit STATUS) -- set the response status and abort the script.  A
- * status of 0 means "stop now, keep the default 200"; any other value must
- * be a real HTTP status.  Aborting is done by throwing a control-flow
- * exception caught in ngx_scheme_eval(), so the rest of the scheme code
- * (including later ngx-say/ngx-log calls) does not run.
+ * (ngx-exit STATUS) -- write the response status into the request and abort
+ * the script.  A status of 0 means "stop now, keep the default 200"; any
+ * other integer is used as-is (no range check, so nginx's special codes
+ * like 444 work).  Aborting is done by throwing a control-flow exception
+ * caught in ngx_scheme_eval(), so the rest of the scheme code (including
+ * later ngx-say/ngx-log calls) does not run.
  */
 static ValueT
 ngx_scheme_stub_exit(VM* vm, ValueT* statusp)
@@ -254,23 +305,20 @@ ngx_scheme_stub_exit(VM* vm, ValueT* statusp)
   }
 
   scm_int status = scm_get_int(vm, statusp);
+  int exit_status = 0;
+
   if (status != 0) {
-    if (status < 100 || status > 599) {
-      scm_error(vm, "ngx-exit: bad HTTP status: %ld", (long) status);
-    }
-    h->status = (int) status;
+    exit_status = (int) status;
+    h->r->headers_out.status = (ngx_uint_t) exit_status;
   }
 
-  h->exited = 1;
-  throw ngx_scheme_exit_signal();
+  throw ngx_scheme_exit_signal(exit_status);
 }
 
 /* library table, same style as the builtin ones (see SCMMath::init) */
 static const RegCProc ngx_scheme_lib[] = {
   RegCProc("ngx-say", ngx_scheme_stub_say, true),  /* variadic */
   RegCProc("ngx-log", ngx_scheme_stub_log, true),  /* variadic: level + messages */
-  RegCProc("ngx-status", ngx_scheme_stub_status),  /* () -> integer */
-  RegCProc("ngx-status-set", ngx_scheme_stub_status_set),  /* (status) */
   RegCProc("ngx-exit", ngx_scheme_stub_exit),      /* (status) */
   RegCProc(NULL, -1)
 };
@@ -356,7 +404,7 @@ ngx_scheme_inject_status_consts(VM *vm)
 }
 
 ngx_scheme_vm_t *
-ngx_scheme_create(ngx_log_t *log)
+ngx_scheme_create(ngx_http_request_t *r)
 {
   ngx_scheme_vm_t *h = (ngx_scheme_vm_t *) malloc(sizeof(*h));
   if (h == NULL) {
@@ -364,12 +412,10 @@ ngx_scheme_create(ngx_log_t *log)
   }
 
   h->vm = NULL;
-  h->log = log;
+  h->r = r;
   h->out.data = NULL;
   h->out.len = 0;
   h->out.cap = 0;
-  h->status = 0;
-  h->exited = 0;
 
   try {
     h->vm = scm_create_vm();
@@ -384,6 +430,31 @@ ngx_scheme_create(ngx_log_t *log)
     scm_register_lib(h->vm, ngx_scheme_lib);
     ngx_scheme_inject_log_consts(h->vm);
     ngx_scheme_inject_status_consts(h->vm);
+
+    /* ngx-status is a virtual global backed by r->headers_out.status: it is
+       never stored in genv; reads and (set! ...) writes go through the genv
+       metatable callbacks built here (native procs that never reach genv) */
+    Sgcvar3(h->vm, mt, mk, mv);
+    *mt = scm_make_table(h->vm);
+
+    ValueT nmsym;
+    CProc cf;
+
+    *mk = scm_make_string(h->vm, "__index");
+    cf.cp2 = ngx_scheme_stub_status_index;
+    setnativeproc(mv, Sr4(h->vm, NativeProcObj,
+        G(h->vm)->getintern()->internsym("~ngx-status-index", &nmsym),
+        cf, 2, false));
+    scm_table_set(h->vm, mt, mk, *mv);
+
+    *mk = scm_make_string(h->vm, "__newindex");
+    cf.cp3 = ngx_scheme_stub_status_newindex;
+    setnativeproc(mv, Sr4(h->vm, NativeProcObj,
+        G(h->vm)->getintern()->internsym("~ngx-status-newindex", &nmsym),
+        cf, 3, false));
+    scm_table_set(h->vm, mt, mk, *mv);
+
+    scm_set_global_metatable(h->vm, mt);
   }
   catch (...) {
     if (h->vm != NULL) {
@@ -458,10 +529,11 @@ ngx_scheme_eval(ngx_scheme_vm_t *h, const char *code, int len,
   try {
     (void) scm_eval_string(h->vm, code, len);
   }
-  catch (const ngx_scheme_exit_signal &) {
-    /* (ngx-exit ...) aborted the script; that is not an error.  The caller
-     * reads the requested status through ngx_scheme_status(). */
-    return 0;
+  catch (const ngx_scheme_exit_signal &e) {
+    /* (ngx-exit N) aborted the script; that is not an error.  Statuses >= 300
+     * are reported back so the caller can let nginx emit its error page; the
+     * rest are a normal response and collapse to NGX_OK. */
+    return e.status >= NGX_HTTP_SPECIAL_RESPONSE ? e.status : NGX_OK;
   }
   catch (const char *e) {
     if (err_cap > 0) {
@@ -500,19 +572,4 @@ ngx_scheme_output(ngx_scheme_vm_t *h, const char **data, int *len)
   if (len != NULL) {
     *len = h->out.len;
   }
-}
-
-int
-ngx_scheme_status(ngx_scheme_vm_t *h)
-{
-  if (h == NULL || h->status == 0) {
-    return NGX_HTTP_OK;
-  }
-  return h->status;
-}
-
-int
-ngx_scheme_exited(ngx_scheme_vm_t *h)
-{
-  return h != NULL && h->exited != 0;
 }

@@ -150,7 +150,6 @@ ngx_http_scheme_handler(ngx_http_request_t *r)
   ngx_chain_t                 *cl;
   const char                  *body;
   int                          body_len;
-  int                          status;
   char                         err[256];
   ngx_int_t                    rc;
 
@@ -160,34 +159,33 @@ ngx_http_scheme_handler(ngx_http_request_t *r)
     return NGX_DECLINED;
   }
 
-  svm = ngx_scheme_create(r->connection->log);
+  svm = ngx_scheme_create(r);
   if (svm == NULL) {
     ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
         "[scheme]: failed to create VM");
     return NGX_HTTP_INTERNAL_SERVER_ERROR;
   }
 
-  if (ngx_scheme_eval(svm, (const char *) slcf->code.data, slcf->code.len,
-          err, sizeof(err)) != 0)
-  {
+  rc = ngx_scheme_eval(svm, (const char *) slcf->code.data, slcf->code.len,
+          err, sizeof(err));
+  if (rc == NGX_ERROR) {
     ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "[scheme]: %s", err);
     ngx_http_scheme_destroy(svm, r);
     return NGX_HTTP_INTERNAL_SERVER_ERROR;
   }
 
-  status = ngx_scheme_status(svm);
-  ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-      "[scheme]: exit=%d status=%d", ngx_scheme_exited(svm), status);
+  ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+      "[scheme]: eval rc %i", (int) rc);
 
-  if (ngx_scheme_exited(svm) && status >= NGX_HTTP_SPECIAL_RESPONSE) {
+  if (rc >= NGX_HTTP_SPECIAL_RESPONSE) {
     /*
-     * (ngx-exit 404) and friends: hand the request back to nginx so its
+     * (ngx-exit N) with N >= 300: hand the request back to nginx so its
      * standard error page (and error_page overrides) applies.  The body
      * accumulated via ngx-say is discarded in favour of nginx's standard
      * error page.
      */
     ngx_http_scheme_destroy(svm, r);
-    return status;
+    return rc;
   }
 
   ngx_scheme_output(svm, &body, &body_len);
@@ -197,7 +195,9 @@ ngx_http_scheme_handler(ngx_http_request_t *r)
 
   ngx_str_set(&r->headers_out.content_type, "text/plain");
   r->headers_out.content_type_len = sizeof("text/plain") - 1;
-  r->headers_out.status = status;
+  if (r->headers_out.status == 0) {
+    r->headers_out.status = NGX_HTTP_OK;
+  }
   r->headers_out.content_length_n = body_len;
 
   if (body_len == 0) {

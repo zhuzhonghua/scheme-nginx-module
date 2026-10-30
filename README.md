@@ -4,7 +4,7 @@ Run Scheme inside nginx like lua-nginx-module.  The module embeds the [dummysche
 and exposes a `content_by_scheme` directive that evaluates
 inline Scheme source and sends the response body via the host function `ngx-say`.
 A second host function, `ngx-log`, writes log messages to nginx's error log;
-`ngx-status` / `ngx-status-set` / `ngx-exit` control the response status.
+`ngx-status` / `ngx-exit` control the response status.
 
 The module follows the classic nginx content-module layout (module struct +
 commands array + create/merge loc_conf + content handler).  It is a generic
@@ -101,20 +101,24 @@ curl http://127.0.0.1:8080/log     # -> log request ok
 tail -n 1 /path/to/error.log       # -> ... [error] ... [scheme]: request logged, 20+22=42
 ```
 
-## ngx-status / ngx-status-set
+## ngx-status
 
-**syntax:** `(ngx-status)` — current response status (200 when untouched)
+**syntax:** `ngx-status` — read the current response status (0 when untouched)
 
-**syntax:** `(ngx-status-set status)` — set the response status and keep running
+**syntax:** `(set! ngx-status status)` — set the response status and keep running
 
-`ngx-status-set` changes the status line without stopping the script; the
-body accumulated so far (and any later `ngx-say` output) is sent with that
-status.  `status` must be an integer in 100..599.
+`ngx-status` is a virtual global variable backed by the request: read it like
+any other global, and write it with `set!`.  Assigning applies the value to
+the response status line immediately; it does not stop the script, and the
+body accumulated via `ngx-say` is sent with it.  `status` must be an integer
+in 100..999 (the status line is 3 digits per RFC 7230); numeric strings are
+coerced.  A value outside the range is logged to error_log and ignored; a
+non-numeric value raises a scheme error.
 
 ```nginx
 location /created {
-    content_by_scheme '(ngx-status-set ngx-http-created)
-                       (ngx-say "created, status=" (ngx-status))';
+    content_by_scheme '(set! ngx-status ngx-http-created)
+                       (ngx-say "created, status=" ngx-status)';
 }
 ```
 
@@ -151,7 +155,7 @@ curl -i http://127.0.0.1:8080/private   # -> HTTP/1.1 401 Unauthorized
 
 The common `NGX_HTTP_*` codes are predefined as top-level constants, named
 `ngx-http-*` (dashes instead of underscores), for use with `ngx-exit` and
-`ngx-status-set`:
+assignments to `ngx-status`:
 
 ```scheme
 ngx-http-ok                      ; 200      ngx-http-no-content              ; 204
