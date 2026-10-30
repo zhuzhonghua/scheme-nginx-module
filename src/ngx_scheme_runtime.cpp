@@ -403,6 +403,59 @@ ngx_scheme_inject_status_consts(VM *vm)
   }
 }
 
+/*
+ * The interpreter is shared by the whole worker process: it is created
+ * lazily on the first request, registered once, and never destroyed (the
+ * worker's exit reclaims it).  Per-request state lives in the handle and is
+ * re-pointed through the registry context on every request.
+ */
+static VM *
+ngx_scheme_acquire_vm()
+{
+  static VM *shared_vm = NULL;   /* one per worker process */
+
+  if (shared_vm != NULL) {
+    return shared_vm;
+  }
+
+  VM *vm = NULL;
+  try {
+    vm = scm_create_vm();
+    if (vm == NULL) {
+      return NULL;
+    }
+
+    scm_register_lib(vm, ngx_scheme_lib);
+    ngx_scheme_inject_log_consts(vm);
+    ngx_scheme_inject_status_consts(vm);
+
+    /* ngx-status is a virtual global backed by r->headers_out.status: it is
+       never stored in genv; reads and (set! ...) writes go through the genv
+       metatable callbacks built here (native procs that never reach genv) */
+    Sgcvar3(vm, mt, mk, mv);
+    *mt = scm_make_table(vm);
+
+    *mk = scm_make_string(vm, "__index");
+    *mv = scm_make_native_proc(vm, RegCProc("~ngx-status-index", ngx_scheme_stub_status_index));
+    scm_table_set(vm, mt, mk, *mv);
+
+    *mk = scm_make_string(vm, "__newindex");
+    *mv = scm_make_native_proc(vm, RegCProc("~ngx-status-newindex", ngx_scheme_stub_status_newindex));
+    scm_table_set(vm, mt, mk, *mv);
+
+    scm_set_global_metatable(vm, mt);
+  }
+  catch (...) {
+    if (vm != NULL) {
+      scm_destroy_vm(vm);
+    }
+    return NULL;
+  }
+
+  shared_vm = vm;
+  return vm;
+}
+
 ngx_scheme_vm_t *
 ngx_scheme_create(ngx_http_request_t *r)
 {
@@ -418,48 +471,18 @@ ngx_scheme_create(ngx_http_request_t *r)
   h->out.cap = 0;
 
   try {
-    h->vm = scm_create_vm();
+    h->vm = ngx_scheme_acquire_vm();
     if (h->vm == NULL) {
       free(h);
       return NULL;
     }
 
-    /* register this handle as a lightuserdata in the VM registry */
+    /* register this handle as a lightuserdata in the VM registry; the VM is
+       shared, so every request re-points the context at its own handle */
     scm_registry_set(h->vm, NGX_SCHEME_CTX_KEY,
         scm_make_lightuserdata(h->vm, h));
-    scm_register_lib(h->vm, ngx_scheme_lib);
-    ngx_scheme_inject_log_consts(h->vm);
-    ngx_scheme_inject_status_consts(h->vm);
-
-    /* ngx-status is a virtual global backed by r->headers_out.status: it is
-       never stored in genv; reads and (set! ...) writes go through the genv
-       metatable callbacks built here (native procs that never reach genv) */
-    Sgcvar3(h->vm, mt, mk, mv);
-    *mt = scm_make_table(h->vm);
-
-    ValueT nmsym;
-    CProc cf;
-
-    *mk = scm_make_string(h->vm, "__index");
-    cf.cp2 = ngx_scheme_stub_status_index;
-    setnativeproc(mv, Sr4(h->vm, NativeProcObj,
-        G(h->vm)->getintern()->internsym("~ngx-status-index", &nmsym),
-        cf, 2, false));
-    scm_table_set(h->vm, mt, mk, *mv);
-
-    *mk = scm_make_string(h->vm, "__newindex");
-    cf.cp3 = ngx_scheme_stub_status_newindex;
-    setnativeproc(mv, Sr4(h->vm, NativeProcObj,
-        G(h->vm)->getintern()->internsym("~ngx-status-newindex", &nmsym),
-        cf, 3, false));
-    scm_table_set(h->vm, mt, mk, *mv);
-
-    scm_set_global_metatable(h->vm, mt);
   }
   catch (...) {
-    if (h->vm != NULL) {
-      scm_destroy_vm(h->vm);
-    }
     free(h);
     return NULL;
   }
@@ -487,29 +510,8 @@ ngx_scheme_destroy(ngx_scheme_vm_t *h, char *err, int err_cap)
     return 0;  /* nothing owned, nothing to tear down */
   }
 
-  if (h->vm != NULL) {
-    try {
-      scm_destroy_vm(h->vm);
-    }
-    catch (const char *e) {
-      /* teardown must not throw out of the request path, but the failure
-          is reported to the caller, which logs it */
-      if (err_cap > 0) {
-        snprintf(err, err_cap, "scheme teardown error: %s",
-            e != NULL ? e : "unknown");
-      }
-      ngx_scheme_free(h);
-      return -1;
-    }
-    catch (...) {
-      if (err_cap > 0) {
-        snprintf(err, err_cap, "scheme teardown error: unknown exception");
-      }
-      ngx_scheme_free(h);
-      return -1;
-    }
-  }
-
+  /* the VM is shared and outlives the request; only the per-request handle
+     and its output buffer are released */
   ngx_scheme_free(h);
   return 0;
 }
