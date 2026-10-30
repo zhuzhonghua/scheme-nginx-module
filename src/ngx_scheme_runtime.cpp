@@ -407,6 +407,15 @@ ngx_scheme_inject_status_consts(VM *vm)
 }
 
 /*
+ * Registry keys of the two ngx-status metatable callbacks.  They are created
+ * once when the worker's VM is initialized and shared by the genv metatable
+ * and every per-location env metatable (native procs are immutable, so one
+ * instance serves all call sites).
+ */
+#define NGX_SCHEME_STATUS_INDEX_PROC   "~ngx-status-index"
+#define NGX_SCHEME_STATUS_NEWINDEX_PROC "~ngx-status-newindex"
+
+/*
  * The interpreter is shared by the whole worker process: it is created
  * lazily on the first request, registered once, and never destroyed (the
  * worker's exit reclaims it).  Per-request state lives in the handle and is
@@ -435,16 +444,18 @@ ngx_scheme_acquire_vm()
     /* ngx-status is a virtual global backed by r->headers_out.status: it is
        never stored in genv; reads and (set! ...) writes go through the genv
        metatable callbacks built here (native procs that never reach genv) */
-    Sgcvar3(vm, mt, mk, mv);
+    Sgcvar4(vm, mt, mk, iv, nv);
     *mt = scm_make_table(vm);
-
+    *iv = scm_make_native_proc(vm, RegCProc(NGX_SCHEME_STATUS_INDEX_PROC, ngx_scheme_stub_status_index));
+    *nv = scm_make_native_proc(vm, RegCProc(NGX_SCHEME_STATUS_NEWINDEX_PROC, ngx_scheme_stub_status_newindex));
+    /* keep one shared instance of each callback in the registry; per-location
+       env metatables fetch them from there instead of building new procs */
+    scm_registry_set(vm, NGX_SCHEME_STATUS_INDEX_PROC, *iv);
+    scm_registry_set(vm, NGX_SCHEME_STATUS_NEWINDEX_PROC, *nv);
     *mk = scm_make_string(vm, "__index");
-    *mv = scm_make_native_proc(vm, RegCProc("~ngx-status-index", ngx_scheme_stub_status_index));
-    scm_table_set(vm, mt, mk, *mv);
-
+    scm_table_set(vm, mt, mk, *iv);
     *mk = scm_make_string(vm, "__newindex");
-    *mv = scm_make_native_proc(vm, RegCProc("~ngx-status-newindex", ngx_scheme_stub_status_newindex));
-    scm_table_set(vm, mt, mk, *mv);
+    scm_table_set(vm, mt, mk, *nv);
 
     scm_set_global_metatable(vm, mt);
   }
@@ -532,16 +543,31 @@ ngx_scheme_eval(ngx_scheme_vm_t *h, const char *code, int len,
   }
 
   try {
-    /* compile once per location script and cache the closure in the registry
-       for the VM's lifetime; requests just apply the cached closure */
-    char key[NGX_SCHEME_CACHE_KEY_LEN] = {0};
-    snprintf(key, sizeof(key), "~code-%p", (const void *) code);
+    /* compile once per location script into a per-location sandbox env and
+       cache both in the registry for the VM's lifetime; requests just apply
+       the cached closure.  define/set! write into the env (not visible from
+       other locations or genv), reads fall back to genv */
+    char code_key[NGX_SCHEME_CACHE_KEY_LEN] = {0};
+    char env_key[NGX_SCHEME_CACHE_KEY_LEN] = {0};
+    snprintf(code_key, sizeof(code_key), "~code-%p", (const void *) code);
+    snprintf(env_key, sizeof(env_key), "~env-%p", (const void *) code);
 
-    Sgcvar1(h->vm, fv);
-    *fv = scm_registry_get(h->vm, key);
+    Sgcvar2(h->vm, fv, envv);
+    *fv = scm_registry_get(h->vm, code_key);
     if (scm_is_null(h->vm, fv)) {
-      *fv = scm_compile(h->vm, code, len);
-      scm_registry_set(h->vm, key, *fv);
+      *envv = scm_make_table(h->vm);
+      *fv = scm_compile(h->vm, envv, code, len);
+
+      /* scm_compile installs {__index = genv} on the env; add the shared
+         ngx-status __newindex callback so (set! ngx-status ...) still reaches
+         the request instead of being swallowed by the env */
+      Sgcvar2(h->vm, niv, nik);
+      *niv = scm_registry_get(h->vm, NGX_SCHEME_STATUS_NEWINDEX_PROC);
+      *nik = scm_make_string(h->vm, "__newindex");
+      hashtableref(hashtableref(envv)->getmetatable())->set(h->vm, nik, niv);
+
+      scm_registry_set(h->vm, env_key, *envv);
+      scm_registry_set(h->vm, code_key, *fv);
     }
 
     ValueT result;
