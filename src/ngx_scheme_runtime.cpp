@@ -19,6 +19,8 @@
 #include "vm.h"
 #include "ngx_scheme_runtime.h"
 
+#include <ngx_http.h>
+
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -109,6 +111,16 @@ struct ngx_scheme_vm_s {
   VM         *vm;   /* the interpreter (created via scm_create_vm) */
   ngx_log_t  *log;  /* nginx error log ngx-log writes to */
   ngx_scheme_buf_t out;  /* response body accumulated via ngx-say */
+  int         status;    /* status set by (ngx-status-set)/(ngx-exit); 0 = default 200 */
+  int         exited;    /* (ngx-exit ...) was called and aborted the script */
+};
+
+/*
+ * Control-flow-only exception thrown by (ngx-exit ...).  It unwinds out of
+ * the interpreter's eval loop and is caught in ngx_scheme_eval(), where it
+ * means "success, script aborted on purpose" rather than an error.
+ */
+struct ngx_scheme_exit_signal {
 };
 
 /* resolve the request handle stored in the VM registry */
@@ -185,10 +197,81 @@ ngx_scheme_stub_say(VM* vm, ValueT* rest)
   return_void();
 }
 
+/* fetch an integer HTTP status argument and range-check it (100..599) */
+static int
+ngx_scheme_status_arg(VM *vm, ValueT *p, const char *who)
+{
+  if (!scm_is_int(vm, p)) {
+    scm_error(vm, "%s: expected integer HTTP status, got %s",
+        who, scm_typename(vm, p));
+  }
+
+  scm_int status = scm_get_int(vm, p);
+  if (status < 100 || status > 599) {
+    scm_error(vm, "%s: bad HTTP status: %ld", who, (long) status);
+  }
+
+  return (int) status;
+}
+
+/*
+ * (ngx-status-set STATUS) -- set the response status without stopping the
+ * script.  The body accumulated so far is still sent, with this status.
+ */
+static ValueT
+ngx_scheme_stub_status_set(VM* vm, ValueT* statusp)
+{
+  ngx_scheme_vm_s *h = ngx_scheme_get_ctx(vm);
+  h->status = ngx_scheme_status_arg(vm, statusp, "ngx-status-set");
+  return_void();
+}
+
+/*
+ * (ngx-status) -- current response status; 200 when nothing has been set.
+ */
+static ValueT
+ngx_scheme_stub_status(VM* vm)
+{
+  ngx_scheme_vm_s *h = ngx_scheme_get_ctx(vm);
+  return scm_make_int(vm, (scm_int) (h->status != 0 ? h->status : 200));
+}
+
+/*
+ * (ngx-exit STATUS) -- set the response status and abort the script.  A
+ * status of 0 means "stop now, keep the default 200"; any other value must
+ * be a real HTTP status.  Aborting is done by throwing a control-flow
+ * exception caught in ngx_scheme_eval(), so the rest of the scheme code
+ * (including later ngx-say/ngx-log calls) does not run.
+ */
+static ValueT
+ngx_scheme_stub_exit(VM* vm, ValueT* statusp)
+{
+  ngx_scheme_vm_s *h = ngx_scheme_get_ctx(vm);
+
+  if (!scm_is_int(vm, statusp)) {
+    scm_error(vm, "ngx-exit: expected integer HTTP status, got %s",
+        scm_typename(vm, statusp));
+  }
+
+  scm_int status = scm_get_int(vm, statusp);
+  if (status != 0) {
+    if (status < 100 || status > 599) {
+      scm_error(vm, "ngx-exit: bad HTTP status: %ld", (long) status);
+    }
+    h->status = (int) status;
+  }
+
+  h->exited = 1;
+  throw ngx_scheme_exit_signal();
+}
+
 /* library table, same style as the builtin ones (see SCMMath::init) */
 static const RegCProc ngx_scheme_lib[] = {
   RegCProc("ngx-say", ngx_scheme_stub_say, true),  /* variadic */
   RegCProc("ngx-log", ngx_scheme_stub_log, true),  /* variadic: level + messages */
+  RegCProc("ngx-status", ngx_scheme_stub_status),  /* () -> integer */
+  RegCProc("ngx-status-set", ngx_scheme_stub_status_set),  /* (status) */
+  RegCProc("ngx-exit", ngx_scheme_stub_exit),      /* (status) */
   RegCProc(NULL, -1)
 };
 
@@ -217,6 +300,61 @@ ngx_scheme_inject_log_consts(VM *vm)
   }
 }
 
+/* Register the HTTP status constants (ngx-http-*) as top-level variables.
+ * They mirror nginx's NGX_HTTP_* codes so scheme code can write
+ * (ngx-exit ngx-http-not-found) instead of a bare number. */
+static void
+ngx_scheme_inject_status_consts(VM *vm)
+{
+  static const struct {
+    const char *name;
+    ngx_int_t   status;
+  } http_status[] = {
+    { "ngx-http-continue",               NGX_HTTP_CONTINUE },
+    { "ngx-http-switching-protocols",    NGX_HTTP_SWITCHING_PROTOCOLS },
+    { "ngx-http-ok",                     NGX_HTTP_OK },
+    { "ngx-http-created",                NGX_HTTP_CREATED },
+    { "ngx-http-accepted",               NGX_HTTP_ACCEPTED },
+    { "ngx-http-no-content",             NGX_HTTP_NO_CONTENT },
+    { "ngx-http-partial-content",        NGX_HTTP_PARTIAL_CONTENT },
+    { "ngx-http-moved-permanently",      NGX_HTTP_MOVED_PERMANENTLY },
+    { "ngx-http-moved-temporarily",      NGX_HTTP_MOVED_TEMPORARILY },
+    { "ngx-http-see-other",              NGX_HTTP_SEE_OTHER },
+    { "ngx-http-not-modified",           NGX_HTTP_NOT_MODIFIED },
+    { "ngx-http-temporary-redirect",     NGX_HTTP_TEMPORARY_REDIRECT },
+    { "ngx-http-permanent-redirect",     NGX_HTTP_PERMANENT_REDIRECT },
+    { "ngx-http-bad-request",            NGX_HTTP_BAD_REQUEST },
+    { "ngx-http-unauthorized",           NGX_HTTP_UNAUTHORIZED },
+    { "ngx-http-forbidden",              NGX_HTTP_FORBIDDEN },
+    { "ngx-http-not-found",              NGX_HTTP_NOT_FOUND },
+    { "ngx-http-not-allowed",            NGX_HTTP_NOT_ALLOWED },
+    { "ngx-http-proxy-auth-required",    NGX_HTTP_PROXY_AUTH_REQUIRED },
+    { "ngx-http-request-time-out",       NGX_HTTP_REQUEST_TIME_OUT },
+    { "ngx-http-conflict",               NGX_HTTP_CONFLICT },
+    { "ngx-http-length-required",        NGX_HTTP_LENGTH_REQUIRED },
+    { "ngx-http-precondition-failed",    NGX_HTTP_PRECONDITION_FAILED },
+    { "ngx-http-request-entity-too-large", NGX_HTTP_REQUEST_ENTITY_TOO_LARGE },
+    { "ngx-http-request-uri-too-large",  NGX_HTTP_REQUEST_URI_TOO_LARGE },
+    { "ngx-http-unsupported-media-type", NGX_HTTP_UNSUPPORTED_MEDIA_TYPE },
+    { "ngx-http-range-not-satisfiable",  NGX_HTTP_RANGE_NOT_SATISFIABLE },
+    { "ngx-http-misdirected-request",    NGX_HTTP_MISDIRECTED_REQUEST },
+    { "ngx-http-too-many-requests",      NGX_HTTP_TOO_MANY_REQUESTS },
+    { "ngx-http-close",                  NGX_HTTP_CLOSE },
+    { "ngx-http-internal-server-error",  NGX_HTTP_INTERNAL_SERVER_ERROR },
+    { "ngx-http-not-implemented",        NGX_HTTP_NOT_IMPLEMENTED },
+    { "ngx-http-bad-gateway",            NGX_HTTP_BAD_GATEWAY },
+    { "ngx-http-service-unavailable",    NGX_HTTP_SERVICE_UNAVAILABLE },
+    { "ngx-http-gateway-time-out",       NGX_HTTP_GATEWAY_TIME_OUT },
+    { "ngx-http-version-not-supported",  NGX_HTTP_VERSION_NOT_SUPPORTED },
+    { "ngx-http-insufficient-storage",   NGX_HTTP_INSUFFICIENT_STORAGE },
+  };
+
+  for (int i = 0; i < (int) (sizeof(http_status) / sizeof(http_status[0])); i++) {
+    scm_set_global(vm, http_status[i].name,
+        scm_make_int(vm, (scm_int) http_status[i].status));
+  }
+}
+
 ngx_scheme_vm_t *
 ngx_scheme_create(ngx_log_t *log)
 {
@@ -230,6 +368,8 @@ ngx_scheme_create(ngx_log_t *log)
   h->out.data = NULL;
   h->out.len = 0;
   h->out.cap = 0;
+  h->status = 0;
+  h->exited = 0;
 
   try {
     h->vm = scm_create_vm();
@@ -243,6 +383,7 @@ ngx_scheme_create(ngx_log_t *log)
         scm_make_lightuserdata(h->vm, h));
     scm_register_lib(h->vm, ngx_scheme_lib);
     ngx_scheme_inject_log_consts(h->vm);
+    ngx_scheme_inject_status_consts(h->vm);
   }
   catch (...) {
     if (h->vm != NULL) {
@@ -317,6 +458,11 @@ ngx_scheme_eval(ngx_scheme_vm_t *h, const char *code, int len,
   try {
     (void) scm_eval_string(h->vm, code, len);
   }
+  catch (const ngx_scheme_exit_signal &) {
+    /* (ngx-exit ...) aborted the script; that is not an error.  The caller
+     * reads the requested status through ngx_scheme_status(). */
+    return 0;
+  }
   catch (const char *e) {
     if (err_cap > 0) {
       snprintf(err, err_cap, "scheme error: %s",
@@ -354,4 +500,19 @@ ngx_scheme_output(ngx_scheme_vm_t *h, const char **data, int *len)
   if (len != NULL) {
     *len = h->out.len;
   }
+}
+
+int
+ngx_scheme_status(ngx_scheme_vm_t *h)
+{
+  if (h == NULL || h->status == 0) {
+    return NGX_HTTP_OK;
+  }
+  return h->status;
+}
+
+int
+ngx_scheme_exited(ngx_scheme_vm_t *h)
+{
+  return h != NULL && h->exited != 0;
 }

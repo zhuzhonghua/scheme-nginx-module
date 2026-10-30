@@ -15,6 +15,11 @@
  * touched.  The handle is stored in the VM's registry as a lightuserdata,
  * and the response buffer is a plain growing buffer owned by this handle.
  *
+ * Status model: `(ngx-status-set N)` records a response status without
+ * stopping the script; `(ngx-exit N)` records it and aborts the evaluation.
+ * The nginx layer reads both through ngx_scheme_status() /
+ * ngx_scheme_exited() after ngx_scheme_eval() returns.
+ *
  * Lifetime model (MVP): one VM is created per request and destroyed when
  * the request finishes.  A worker may run many requests concurrently and
  * the VM is not thread-safe, hence the per-request isolation.  (Future:
@@ -77,6 +82,21 @@ int ngx_scheme_eval(ngx_scheme_vm_t *vm, const char *code, int len,
  * body is empty.
  */
 void ngx_scheme_output(ngx_scheme_vm_t *vm, const char **data, int *len);
+
+/*
+ * Response status requested by the scheme code via `(ngx-status-set N)` or
+ * `(ngx-exit N)`.  Returns the default 200 when the script left it
+ * untouched.  Never returns 0.
+ */
+int ngx_scheme_status(ngx_scheme_vm_t *vm);
+
+/*
+ * Non-zero when `(ngx-exit ...)` aborted the script.  The nginx layer uses
+ * this to decide whether the accumulated body is still meaningful: for
+ * `(ngx-exit N)` with N >= 300 it hands the request back to nginx (which
+ * emits its standard error page) instead of sending the body.
+ */
+int ngx_scheme_exited(ngx_scheme_vm_t *vm);
 
 #ifdef __cplusplus
 }

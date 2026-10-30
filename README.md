@@ -3,7 +3,8 @@
 Run Scheme inside nginx like lua-nginx-module.  The module embeds the [dummyscheme](https://github.com/zhuzhonghua/dummyscheme)
 and exposes a `content_by_scheme` directive that evaluates
 inline Scheme source and sends the response body via the host function `ngx-say`.
-A second host function, `ngx-log`, writes log messages to nginx's error log.
+A second host function, `ngx-log`, writes log messages to nginx's error log;
+`ngx-status` / `ngx-status-set` / `ngx-exit` control the response status.
 
 The module follows the classic nginx content-module layout (module struct +
 commands array + create/merge loc_conf + content handler).  It is a generic
@@ -99,3 +100,68 @@ server {
 curl http://127.0.0.1:8080/log     # -> log request ok
 tail -n 1 /path/to/error.log       # -> ... [error] ... [scheme]: request logged, 20+22=42
 ```
+
+## ngx-status / ngx-status-set
+
+**syntax:** `(ngx-status)` — current response status (200 when untouched)
+
+**syntax:** `(ngx-status-set status)` — set the response status and keep running
+
+`ngx-status-set` changes the status line without stopping the script; the
+body accumulated so far (and any later `ngx-say` output) is sent with that
+status.  `status` must be an integer in 100..599.
+
+```nginx
+location /created {
+    content_by_scheme '(ngx-status-set ngx-http-created)
+                       (ngx-say "created, status=" (ngx-status))';
+}
+```
+
+```sh
+curl -i http://127.0.0.1:8080/created   # -> HTTP/1.1 201 Created
+                                        #    created, status=201
+```
+
+## ngx-exit
+
+**syntax:** `(ngx-exit status)`
+
+Finishes the request immediately: the rest of the scheme code does **not**
+run.  For `status >= 300`, nginx handles the request as an error/redirect
+(the body accumulated via `ngx-say` is discarded and nginx's standard error
+page, including any `error_page` override, is used).  For `status` in
+200..299 the accumulated body is still sent with that status, and
+`(ngx-exit 0)` stops the script while keeping the default 200 status and the
+body collected so far.
+
+```nginx
+location /private {
+    content_by_scheme '(if (not (authorized?))
+                           (ngx-exit ngx-http-unauthorized))
+                       (ngx-say "secret")';
+}
+```
+
+```sh
+curl -i http://127.0.0.1:8080/private   # -> HTTP/1.1 401 Unauthorized
+```
+
+## HTTP status constants
+
+The common `NGX_HTTP_*` codes are predefined as top-level constants, named
+`ngx-http-*` (dashes instead of underscores), for use with `ngx-exit` and
+`ngx-status-set`:
+
+```scheme
+ngx-http-ok                      ; 200      ngx-http-no-content              ; 204
+ngx-http-created                 ; 201      ngx-http-moved-permanently       ; 301
+ngx-http-moved-temporarily       ; 302      ngx-http-not-modified            ; 304
+ngx-http-bad-request             ; 400      ngx-http-unauthorized            ; 401
+ngx-http-forbidden               ; 403      ngx-http-not-found               ; 404
+ngx-http-not-allowed             ; 405      ngx-http-too-many-requests       ; 429
+ngx-http-internal-server-error   ; 500      ngx-http-bad-gateway             ; 502
+ngx-http-service-unavailable     ; 503      ngx-http-gateway-time-out        ; 504
+```
+
+The full list is in `src/ngx_scheme_runtime.cpp` (`ngx_scheme_inject_status_consts`).
