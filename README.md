@@ -4,7 +4,8 @@ Run Scheme inside nginx like lua-nginx-module.  The module embeds the [dummysche
 and exposes a `content_by_scheme` directive that evaluates
 inline Scheme source and sends the response body via the host function `ngx-say`.
 A second host function, `ngx-log`, writes log messages to nginx's error log;
-`ngx-status` / `ngx-exit` control the response status.
+`ngx-status` / `ngx-exit` control the response status, and
+`ngx-header-ref` / `ngx-header-set!` read and write response headers.
 
 The module follows the classic nginx content-module layout (module struct +
 commands array + create/merge loc_conf + content handler).  It is a generic
@@ -126,6 +127,45 @@ location /created {
 curl -i http://127.0.0.1:8080/created   # -> HTTP/1.1 201 Created
                                         #    created, status=201
 ```
+
+## ngx-header
+
+**syntax:** `(ngx-header-ref name)` — read a response header (`#f` when unset)
+
+**syntax:** `(ngx-header-set! name value)` — set, replace or remove a response header
+
+Names are strings or symbols and are matched case-insensitively; `_` is
+treated as `-`, so `"X_Custom"` and `"x-custom"` address the same header.
+Setting a name that already exists replaces its value in place, so a header
+is never duplicated.  `value` is converted with the same semantics as
+`ngx-say` (strings verbatim, other values via write semantics); `#f` removes
+the header instead of setting it.
+
+`Content-Type` and `Content-Length` are written to the request fields nginx
+emits them from, so they take precedence over the module defaults
+(`text/plain` and the accumulated body length).  `Location` also updates
+nginx's redirect bookkeeping, so it works together with `ngx-exit`:
+
+```nginx
+location /json {
+    content_by_scheme '(ngx-header-set! "Content-Type" "application/json")
+                       (ngx-say "{}")';
+}
+
+location /go {
+    content_by_scheme '(ngx-header-set! "Location" "/hello")
+                       (ngx-exit ngx-http-moved-temporarily)';
+}
+```
+
+```sh
+curl -i http://127.0.0.1:8080/json   # -> Content-Type: application/json
+curl -i http://127.0.0.1:8080/go     # -> HTTP/1.1 302, Location: http://.../hello
+```
+
+A header that has multiple values reads back as its first value.  The
+module's default `Content-Type` is applied after the script finishes, so a
+script that did not set it reads `#f` while it runs.
 
 ## ngx-exit
 

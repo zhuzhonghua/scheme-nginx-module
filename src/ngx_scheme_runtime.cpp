@@ -200,10 +200,10 @@ ngx_scheme_stub_say(VM* vm, ValueT* rest)
   return_void();
 }
 
-/* fetch an HTTP status argument: an integer, or a string that parses as one
+/* fetch an integer argument: an integer, or a string that parses as one
  * (numeric strings are accepted); anything else raises a scheme error */
 static scm_int
-ngx_scheme_status_arg(VM *vm, ValueT *p, const char *who)
+ngx_scheme_int_arg(VM *vm, ValueT *p, const char *who, const char *what)
 {
   if (scm_is_int(vm, p)) {
     return scm_get_int(vm, p);
@@ -222,8 +222,8 @@ ngx_scheme_status_arg(VM *vm, ValueT *p, const char *who)
     }
   }
 
-  scm_error(vm, "%s: expected integer HTTP status, got %s",
-      who, scm_typename(vm, p));
+  scm_error(vm, "%s: expected integer %s, got %s",
+      who, what, scm_typename(vm, p));
   return 0;  /* not reached */
 }
 
@@ -274,7 +274,7 @@ ngx_scheme_stub_status_newindex(VM* vm, ValueT* tbl, ValueT* key, ValueT* val)
   }
 
   ngx_scheme_vm_s *h = ngx_scheme_get_ctx(vm);
-  scm_int status = ngx_scheme_status_arg(vm, val, "ngx-status");
+  scm_int status = ngx_scheme_int_arg(vm, val, "ngx-status", "HTTP status");
 
   /* the status line must be 3 digits (RFC 7230 sec 3.1.2) */
   if (status < 100 || status > 999) {
@@ -318,11 +318,281 @@ ngx_scheme_stub_exit(VM* vm, ValueT* statusp)
   throw ngx_scheme_exit_signal(exit_status);
 }
 
+/*
+ * Response header helpers.  Names are matched case-insensitively and '_' is
+ * normalised to '-', so "X_Custom" and "x-custom" address the same header.
+ * A leading stack buffer keeps the common case allocation-free; longer names
+ * are rejected instead of truncated.
+ */
+#define NGX_SCHEME_HEADER_NAME_MAX 128
+
+/* lower-case a scheme header name into dst; returns its length */
+static int
+ngx_scheme_header_name(VM *vm, ValueT *p, u_char *dst, size_t cap,
+    const char *who)
+{
+  const char *s;
+  int n;
+
+  if (scm_is_string(vm, p)) {
+    s = scm_get_string(vm, p, &n);
+  } else if (issym(p)) {
+    s = Ssstr(symref(p));
+    n = (int) strlen(s);
+  } else {
+    scm_error(vm, "%s: expected header name, got %s",
+        who, scm_typename(vm, p));
+    return 0;  /* not reached */
+  }
+
+  if (n <= 0 || (size_t) n >= cap) {
+    scm_error(vm, "%s: invalid header name", who);
+  }
+
+  for (int i = 0; i < n; i++) {
+    u_char c = (u_char) s[i];
+    if (c == '_') {
+      c = '-';
+    }
+    dst[i] = (u_char) ngx_tolower(c);
+  }
+  dst[n] = '\0';
+
+  return n;
+}
+
+/* look up a live response header by its already-lowercased name */
+static ngx_table_elt_t *
+ngx_scheme_header_find(ngx_http_request_t *r, const u_char *name, size_t len)
+{
+  ngx_list_part_t *part;
+  ngx_table_elt_t *h;
+  ngx_uint_t        i;
+
+  part = &r->headers_out.headers.part;
+  h = (ngx_table_elt_t *) part->elts;
+
+  for (i = 0; /* void */; i++) {
+    if (i >= part->nelts) {
+      if (part->next == NULL) {
+        break;
+      }
+      part = part->next;
+      h = (ngx_table_elt_t *) part->elts;
+      i = 0;
+    }
+
+    /* hash == 0 marks a deleted entry, the nginx convention */
+    if (h[i].hash == 0) {
+      continue;
+    }
+
+    if (h[i].key.len == len
+        && ngx_strncasecmp(h[i].key.data, (u_char *) name, len) == 0)
+    {
+      return &h[i];
+    }
+  }
+
+  return NULL;
+}
+
+/* copy a scheme value into the request pool as an nginx string */
+static void
+ngx_scheme_header_copy_value(VM *vm, ValueT *p, ngx_pool_t *pool,
+    ngx_str_t *out)
+{
+  int n = 0;
+  const char *s = scm_is_string(vm, p) ? scm_get_string(vm, p, &n)
+                                       : scm_tostring(vm, p, &n);
+
+  if (n < 0) {
+    n = 0;
+  }
+
+  u_char *data = (u_char *) ngx_pnalloc(pool, (size_t) n + 1);
+  if (data == NULL) {
+    throw "OutOfMemory";
+  }
+
+  if (n > 0) {
+    ngx_memcpy(data, s, (size_t) n);
+  }
+  data[n] = '\0';
+
+  out->data = data;
+  out->len = (size_t) n;
+}
+
+/* append a new header entry; the key is copied into the request pool */
+static ngx_table_elt_t *
+ngx_scheme_header_add(ngx_http_request_t *r, const u_char *name, size_t len,
+    ngx_str_t *value)
+{
+  u_char *key;
+  ngx_table_elt_t *h;
+
+  h = (ngx_table_elt_t *) ngx_list_push(&r->headers_out.headers);
+  if (h == NULL) {
+    throw "OutOfMemory";
+  }
+
+  key = (u_char *) ngx_pnalloc(r->pool, len);
+  if (key == NULL) {
+    throw "OutOfMemory";
+  }
+  ngx_memcpy(key, name, len);
+
+  h->hash = 1;
+  h->key.data = key;
+  h->key.len = len;
+  h->value = *value;
+
+  return h;
+}
+
+/*
+ * (ngx-header-ref NAME) -- read a response header.  NAME is a string or a
+ * symbol; matching ignores case and treats '_' like '-'.  Returns the first
+ * value as a string, or #f when the header is not set.  Content-Type and
+ * Content-Length are answered from the request fields nginx uses for them,
+ * so they read back what was set with ngx-header-set!.
+ */
+static ValueT
+ngx_scheme_stub_header_ref(VM *vm, ValueT *namep)
+{
+  ngx_scheme_vm_s *h = ngx_scheme_get_ctx(vm);
+  u_char name[NGX_SCHEME_HEADER_NAME_MAX] = {0};
+  int nlen = ngx_scheme_header_name(vm, namep, name, sizeof(name),
+      "ngx-header-ref");
+
+  if (nlen == (int) (sizeof("content-type") - 1)
+      && ngx_strncmp(name, "content-type", nlen) == 0)
+  {
+    if (h->r->headers_out.content_type.len == 0) {
+      return scm_make_bool(vm, false);
+    }
+    return scm_make_string(vm,
+        (const char *) h->r->headers_out.content_type.data,
+        (int) h->r->headers_out.content_type.len);
+  }
+
+  if (nlen == (int) (sizeof("content-length") - 1)
+      && ngx_strncmp(name, "content-length", nlen) == 0)
+  {
+    if (h->r->headers_out.content_length_n < 0) {
+      return scm_make_bool(vm, false);
+    }
+    char buf[NGX_INT_T_LEN];
+    int n = snprintf(buf, sizeof(buf), "%lld",
+        (long long) h->r->headers_out.content_length_n);
+    return scm_make_string(vm, buf, n);
+  }
+
+  ngx_table_elt_t *hdr = ngx_scheme_header_find(h->r, name, (size_t) nlen);
+  if (hdr == NULL) {
+    return scm_make_bool(vm, false);
+  }
+
+  return scm_make_string(vm, (const char *) hdr->value.data,
+      (int) hdr->value.len);
+}
+
+/*
+ * (ngx-header-set! NAME VALUE) -- set, replace or remove a response header.
+ * VALUE #f removes the header; any other value is converted to a string (same
+ * semantics as ngx-say).  Setting an existing name replaces its value in
+ * place, so a header is never duplicated.  Content-Type and Content-Length
+ * are written to the request fields nginx emits them from; Location also
+ * updates r->headers_out.location so nginx's absolute-redirect handling sees
+ * it.
+ */
+static ValueT
+ngx_scheme_stub_header_set(VM *vm, ValueT *namep, ValueT *valp)
+{
+  ngx_scheme_vm_s *h = ngx_scheme_get_ctx(vm);
+  ngx_http_request_t *r = h->r;
+  u_char name[NGX_SCHEME_HEADER_NAME_MAX] = {0};
+  int nlen = ngx_scheme_header_name(vm, namep, name, sizeof(name),
+      "ngx-header-set!");
+  bool remove = scm_is_false(vm, valp);
+
+  if (nlen == (int) (sizeof("content-type") - 1)
+      && ngx_strncmp(name, "content-type", nlen) == 0)
+  {
+    ngx_table_elt_t *old = ngx_scheme_header_find(r, name, (size_t) nlen);
+    if (old != NULL) {
+      old->hash = 0;
+    }
+
+    if (remove) {
+      ngx_str_null(&r->headers_out.content_type);
+      r->headers_out.content_type_len = 0;
+      r->headers_out.content_type_lowcase = NULL;
+    } else {
+      ngx_scheme_header_copy_value(vm, valp, r->pool,
+          &r->headers_out.content_type);
+      r->headers_out.content_type_len = r->headers_out.content_type.len;
+      r->headers_out.content_type_lowcase = NULL;
+    }
+    return_void();
+  }
+
+  if (nlen == (int) (sizeof("content-length") - 1)
+      && ngx_strncmp(name, "content-length", nlen) == 0)
+  {
+    if (remove) {
+      ngx_http_clear_content_length(r);
+      return_void();
+    }
+
+    scm_int v = ngx_scheme_int_arg(vm, valp, "ngx-header-set!",
+        "content length");
+    if (v < 0) {
+      scm_error(vm, "ngx-header-set!: bad content length: %d", (int) v);
+    }
+    ngx_http_clear_content_length(r);
+    r->headers_out.content_length_n = (off_t) v;
+    return_void();
+  }
+
+  ngx_table_elt_t *old = ngx_scheme_header_find(r, name, (size_t) nlen);
+
+  if (remove) {
+    if (old != NULL) {
+      old->hash = 0;
+      if (r->headers_out.location == old) {
+        r->headers_out.location = NULL;
+      }
+    }
+    return_void();
+  }
+
+  ngx_str_t value;
+  ngx_scheme_header_copy_value(vm, valp, r->pool, &value);
+
+  if (old != NULL) {
+    old->value = value;
+    return_void();
+  }
+
+  ngx_table_elt_t *hdr = ngx_scheme_header_add(r, name, (size_t) nlen, &value);
+  if (nlen == (int) (sizeof("location") - 1)
+      && ngx_strncmp(name, "location", nlen) == 0)
+  {
+    r->headers_out.location = hdr;
+  }
+
+  return_void();
+}
+
 /* library table, same style as the builtin ones (see SCMMath::init) */
 static const RegCProc ngx_scheme_lib[] = {
   RegCProc("ngx-say", ngx_scheme_stub_say, true),  /* variadic */
   RegCProc("ngx-log", ngx_scheme_stub_log, true),  /* variadic: level + messages */
   RegCProc("ngx-exit", ngx_scheme_stub_exit),      /* (status) */
+  RegCProc("ngx-header-ref", ngx_scheme_stub_header_ref),   /* (name) */
+  RegCProc("ngx-header-set!", ngx_scheme_stub_header_set),  /* (name value) */
   RegCProc(NULL, -1)
 };
 

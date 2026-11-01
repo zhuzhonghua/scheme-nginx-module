@@ -193,12 +193,18 @@ ngx_http_scheme_handler(ngx_http_request_t *r)
   ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
       "[scheme]: body %d bytes", body_len);
 
-  ngx_str_set(&r->headers_out.content_type, "text/plain");
-  r->headers_out.content_type_len = sizeof("text/plain") - 1;
+  /* a Content-Type / Content-Length set by the scheme code wins; fill in the
+     module defaults only when it left them untouched */
+  if (r->headers_out.content_type.len == 0) {
+    ngx_str_set(&r->headers_out.content_type, "text/plain");
+    r->headers_out.content_type_len = sizeof("text/plain") - 1;
+  }
   if (r->headers_out.status == 0) {
     r->headers_out.status = NGX_HTTP_OK;
   }
-  r->headers_out.content_length_n = body_len;
+  if (body_len == 0 || r->headers_out.content_length_n < 0) {
+    r->headers_out.content_length_n = body_len;
+  }
 
   if (body_len == 0) {
     /*
