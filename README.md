@@ -4,8 +4,9 @@ Run Scheme inside nginx like lua-nginx-module.  The module embeds the [dummysche
 and exposes a `content_by_scheme` directive that evaluates
 inline Scheme source and sends the response body via the host function `ngx-say`.
 A second host function, `ngx-log`, writes log messages to nginx's error log;
-`ngx-status` / `ngx-exit` control the response status, and
-`ngx-header-ref` / `ngx-header-set!` read and write response headers.
+`ngx-status` / `ngx-exit` control the response status,
+`ngx-header-ref` / `ngx-header-set!` read and write response headers, and
+`ngx-var-ref` reads nginx variables such as `remote_addr`.
 
 The module follows the classic nginx content-module layout (module struct +
 commands array + create/merge loc_conf + content handler).  It is a generic
@@ -166,6 +167,46 @@ curl -i http://127.0.0.1:8080/go     # -> HTTP/1.1 302, Location: http://.../hel
 A header that has multiple values reads back as its first value.  The
 module's default `Content-Type` is applied after the script finishes, so a
 script that did not set it reads `#f` while it runs.
+
+## ngx-var
+
+**syntax:** `(ngx-var-ref name)` — read an nginx variable (`#f` when not found)
+
+`name` is a string or a symbol; it is lowercased before lookup, so
+`"REQUEST_METHOD"` and `'request_method` are equivalent.  Underscores are
+kept (this is not the header-name rule), so all of nginx's usual variables
+work:
+
+```scheme
+(ngx-var-ref "request_method")   ; GET
+(ngx-var-ref "request_uri")      ; /path?query
+(ngx-var-ref "remote_addr")      ; 203.0.113.7
+(ngx-var-ref "arg_q")            ; ?q=... value
+(ngx-var-ref "http_user_agent")  ; request header User-Agent
+(ngx-var-ref "cookie_sid")       ; request cookie sid
+(ngx-var-ref "sent_http_content_type")  ; response header
+```
+
+The value is copied into a scheme string, so it remains valid after the
+request ends.  A variable that does not exist, has no value yet, or is not
+valid at this point of the request reads back as `#f`.  A leading `$` is not
+accepted: write `"remote_addr"`, not `"$remote_addr"`.
+
+```nginx
+location /info {
+    content_by_scheme '(ngx-say (ngx-var-ref "request_method") " "
+                                (ngx-var-ref "request_uri") " from "
+                                (ngx-var-ref "remote_addr"))';
+}
+```
+
+```sh
+curl http://127.0.0.1:8080/info   # -> GET /info from 127.0.0.1
+```
+
+Only reading is supported for now; assigning nginx variables needs an
+indexed variable configured at startup plus its validator, and is a separate
+step.
 
 ## ngx-exit
 

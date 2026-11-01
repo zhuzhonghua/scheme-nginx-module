@@ -326,6 +326,9 @@ ngx_scheme_stub_exit(VM* vm, ValueT* statusp)
  */
 #define NGX_SCHEME_HEADER_NAME_MAX 128
 
+/* stack buffer for variable names; longer names are rejected, not truncated */
+#define NGX_SCHEME_VAR_NAME_MAX 128
+
 /* lower-case a scheme header name into dst; returns its length */
 static int
 ngx_scheme_header_name(VM *vm, ValueT *p, u_char *dst, size_t cap,
@@ -586,6 +589,57 @@ ngx_scheme_stub_header_set(VM *vm, ValueT *namep, ValueT *valp)
   return_void();
 }
 
+/*
+ * (ngx-var-ref NAME) -- value of an nginx variable as a string, or #f when
+ * the variable does not exist or is not found at this point of the request.
+ * NAME is a string or a symbol and is lowercased before lookup (nginx
+ * variable names are lowercase); '_' is kept, so http_user_agent,
+ * arg_name, cookie_x and friends all work.  No leading '$' is expected.
+ * The value is copied into a scheme string before returning, so it stays
+ * valid after the request pool is recycled.
+ */
+static ValueT
+ngx_scheme_stub_var_ref(VM *vm, ValueT *namep)
+{
+  ngx_scheme_vm_s *h = ngx_scheme_get_ctx(vm);
+  const char *s;
+  int n;
+
+  if (scm_is_string(vm, namep)) {
+    s = scm_get_string(vm, namep, &n);
+  } else if (issym(namep)) {
+    s = Ssstr(symref(namep));
+    n = (int) strlen(s);
+  } else {
+    scm_error(vm, "ngx-var-ref: expected variable name, got %s",
+        scm_typename(vm, namep));
+    return scm_make_bool(vm, false);  /* not reached */
+  }
+
+  if (n <= 0 || (size_t) n >= NGX_SCHEME_VAR_NAME_MAX) {
+    scm_error(vm, "ngx-var-ref: invalid variable name");
+  }
+
+  u_char name[NGX_SCHEME_VAR_NAME_MAX] = {0};
+  for (int i = 0; i < n; i++) {
+    name[i] = (u_char) ngx_tolower((u_char) s[i]);
+  }
+  name[n] = '\0';
+
+  ngx_str_t vname;
+  vname.data = name;
+  vname.len = (size_t) n;
+
+  ngx_http_variable_value_t *vv = ngx_http_get_variable(h->r, &vname,
+      ngx_hash_key_lc(name, (size_t) n));
+
+  if (vv == NULL || vv->not_found) {
+    return scm_make_bool(vm, false);
+  }
+
+  return scm_make_string(vm, (const char *) vv->data, (int) vv->len);
+}
+
 /* library table, same style as the builtin ones (see SCMMath::init) */
 static const RegCProc ngx_scheme_lib[] = {
   RegCProc("ngx-say", ngx_scheme_stub_say, true),  /* variadic */
@@ -593,6 +647,7 @@ static const RegCProc ngx_scheme_lib[] = {
   RegCProc("ngx-exit", ngx_scheme_stub_exit),      /* (status) */
   RegCProc("ngx-header-ref", ngx_scheme_stub_header_ref),   /* (name) */
   RegCProc("ngx-header-set!", ngx_scheme_stub_header_set),  /* (name value) */
+  RegCProc("ngx-var-ref", ngx_scheme_stub_var_ref),         /* (name) */
   RegCProc(NULL, -1)
 };
 
