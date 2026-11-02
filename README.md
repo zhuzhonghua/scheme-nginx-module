@@ -13,6 +13,10 @@ commands array + create/merge loc_conf + content handler).  It is a generic
 third-party nginx module; the host scheme interpreter is a separate project
 and is linked in as a dependency.
 
+Two directives are provided: `content_by_scheme` (content phase) and
+`access_by_scheme` (access phase, for auth).  Both take inline Scheme source
+and both are compiled once per location.
+
 ### Build
 
 ```sh
@@ -57,6 +61,40 @@ curl http://127.0.0.1:8080/fib     # -> fib(24)=46368
 
 Note that `display` / `write` go to the VM's default output (stderr), not
 into the body; use `ngx-say` for response output.
+
+## access_by_scheme
+
+**syntax:** `access_by_scheme '<scheme>';`
+
+Runs the scheme source in nginx's access phase, before the content handler.
+It is meant for authentication / authorization and is normally used together
+with a content handler or a static file in the same location:
+
+```nginx
+location /private {
+    access_by_scheme '(if (equal? (ngx-var-ref "arg_token") "ok")
+                          #f
+                          (ngx-exit ngx-http-unauthorized))';
+    content_by_scheme '(ngx-say "secret")';
+}
+```
+
+```sh
+curl -i 'http://127.0.0.1:8080/private?token=ok'  # -> 200 secret
+curl -i 'http://127.0.0.1:8080/private'           # -> 401 Unauthorized
+```
+
+An `(ngx-exit N)` with `N >= 300` ends the request with that status (nginx's
+error page and `error_page` overrides apply) and the content handler does not
+run.  `(ngx-exit 0)` and 2xx statuses just finish the access script and let
+the request continue.  A scheme error becomes 500.  Response headers set with
+`ngx-header-set!` (for example a redirect `Location`) are kept.
+
+Body written with `ngx-say` is discarded, because the access phase produces
+no response body.  Like `content_by_scheme`, the source is compiled once per
+location and reused across requests; the environment is separate from the
+content script's, so values should be passed through `ngx-var-ref` or
+request headers rather than top-level variables.
 
 ## ngx-log
 
