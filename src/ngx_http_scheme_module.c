@@ -3,10 +3,11 @@
  * host project) inside nginx.
  *
  * A generic NGX_HTTP_MODULE with location-scoped config:
- *   - two directives taking scheme source inline:
+ *   - three directives taking scheme source inline:
  *       `content_by_scheme` -- the response content handler
  *       `access_by_scheme`  -- an access-phase handler for auth / filtering
- *   - both handlers create a per-request VM (see ngx_scheme_runtime)
+ *       `log_by_scheme`     -- a log-phase handler for request logging
+ *   - all handlers create a per-request VM (see ngx_scheme_runtime)
  *   - the classic content-module layout (module struct + commands array +
  *     create/merge loc_conf + content handler)
  *
@@ -22,6 +23,11 @@
  *                              (ngx-exit ngx-http-unauthorized))';
  *       content_by_scheme '(ngx-say "secret")';
  *   }
+ *
+ *   location /logged {
+ *       content_by_scheme '(ngx-say "ok")';
+ *       log_by_scheme '(ngx-log ngx-info "status=" (ngx-var-ref "status"))';
+ *   }
  */
 #include <ngx_config.h>
 #include <ngx_core.h>
@@ -35,10 +41,14 @@ typedef struct {
 
   ngx_str_t   access_code;   /* inline access-phase scheme source */
   ngx_flag_t  access_enabled;
+
+  ngx_str_t   log_code;      /* inline log-phase scheme source */
+  ngx_flag_t  log_enabled;
 } ngx_http_scheme_loc_conf_t;
 
 static ngx_int_t ngx_http_scheme_handler(ngx_http_request_t *r);
 static ngx_int_t ngx_http_scheme_access_handler(ngx_http_request_t *r);
+static ngx_int_t ngx_http_scheme_log_handler(ngx_http_request_t *r);
 
 static ngx_int_t ngx_http_scheme_init(ngx_conf_t *cf);
 static void *ngx_http_scheme_create_loc_conf(ngx_conf_t *cf);
@@ -47,6 +57,8 @@ static char *ngx_http_scheme_merge_loc_conf(ngx_conf_t *cf, void *parent,
 static char *ngx_http_scheme_content_by_scheme(ngx_conf_t *cf,
   ngx_command_t *cmd, void *conf);
 static char *ngx_http_scheme_access_by_scheme(ngx_conf_t *cf,
+  ngx_command_t *cmd, void *conf);
+static char *ngx_http_scheme_log_by_scheme(ngx_conf_t *cf,
   ngx_command_t *cmd, void *conf);
 
 static ngx_command_t  ngx_http_scheme_commands[] = {
@@ -61,6 +73,13 @@ static ngx_command_t  ngx_http_scheme_commands[] = {
   { ngx_string("access_by_scheme"),
     NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
     ngx_http_scheme_access_by_scheme,
+    NGX_HTTP_LOC_CONF_OFFSET,
+    0,
+    NULL },
+
+  { ngx_string("log_by_scheme"),
+    NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+    ngx_http_scheme_log_by_scheme,
     NGX_HTTP_LOC_CONF_OFFSET,
     0,
     NULL },
@@ -113,6 +132,9 @@ ngx_http_scheme_create_loc_conf(ngx_conf_t *cf)
   ngx_str_null(&conf->access_code);
   conf->access_enabled = NGX_CONF_UNSET;
 
+  ngx_str_null(&conf->log_code);
+  conf->log_enabled = NGX_CONF_UNSET;
+
   return conf;
 }
 
@@ -127,6 +149,9 @@ ngx_http_scheme_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 
   ngx_conf_merge_str_value(conf->access_code, prev->access_code, "");
   ngx_conf_merge_value(conf->access_enabled, prev->access_enabled, 0);
+
+  ngx_conf_merge_str_value(conf->log_code, prev->log_code, "");
+  ngx_conf_merge_value(conf->log_enabled, prev->log_enabled, 0);
 
   return NGX_CONF_OK;
 }
@@ -173,10 +198,28 @@ ngx_http_scheme_access_by_scheme(ngx_conf_t *cf, ngx_command_t *cmd,
   return NGX_CONF_OK;
 }
 
+static char *
+ngx_http_scheme_log_by_scheme(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+  ngx_http_scheme_loc_conf_t *slcf = conf;
+  ngx_str_t                  *value;
+
+  if (slcf->log_code.len != 0) {
+    return "is duplicate";
+  }
+
+  value = cf->args->elts;
+
+  slcf->log_code = value[1];
+  slcf->log_enabled = 1;
+
+  return NGX_CONF_OK;
+}
+
 /*
- * Register the access-phase handler.  It is appended to the access phase
- * like any other access module; locations without access_by_scheme return
- * NGX_DECLINED so the rest of the chain keeps running.
+ * Register the access- and log-phase handlers.  They are appended to their
+ * phases like any other module; locations without the matching directive
+ * leave the chain alone.
  */
 static ngx_int_t
 ngx_http_scheme_init(ngx_conf_t *cf)
@@ -190,8 +233,13 @@ ngx_http_scheme_init(ngx_conf_t *cf)
   if (h == NULL) {
     return NGX_ERROR;
   }
-
   *h = ngx_http_scheme_access_handler;
+
+  h = ngx_array_push(&cmcf->phases[NGX_HTTP_LOG_PHASE].handlers);
+  if (h == NULL) {
+    return NGX_ERROR;
+  }
+  *h = ngx_http_scheme_log_handler;
 
   return NGX_OK;
 }
@@ -368,6 +416,48 @@ ngx_http_scheme_access_handler(ngx_http_request_t *r)
   if (rc >= NGX_HTTP_SPECIAL_RESPONSE) {
     return rc;
   }
+
+  return NGX_OK;
+}
+
+/*
+ * Log-phase handler: runs log_by_scheme after the response has been sent.
+ * It cannot change the response, so every outcome returns NGX_OK; scheme
+ * errors are written to error_log and otherwise ignored.  (ngx-exit N) only
+ * stops the script.  Body written with ngx-say is discarded.
+ */
+static ngx_int_t
+ngx_http_scheme_log_handler(ngx_http_request_t *r)
+{
+  ngx_http_scheme_loc_conf_t  *slcf;
+  ngx_scheme_vm_t             *svm;
+  char                         err[256];
+  ngx_int_t                    rc;
+
+  slcf = ngx_http_get_module_loc_conf(r, ngx_http_scheme_module);
+
+  if (!slcf->log_enabled) {
+    return NGX_OK;
+  }
+
+  svm = ngx_scheme_create(r);
+  if (svm == NULL) {
+    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+        "[scheme]: failed to create VM");
+    return NGX_OK;
+  }
+
+  rc = ngx_scheme_eval(svm, (const char *) slcf->log_code.data,
+          slcf->log_code.len, err, sizeof(err));
+
+  if (rc == NGX_ERROR) {
+    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "[scheme]: %s", err);
+  }
+
+  ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+      "[scheme]: log eval rc %i", (int) rc);
+
+  ngx_http_scheme_destroy(svm, r);
 
   return NGX_OK;
 }

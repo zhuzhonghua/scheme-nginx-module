@@ -1,8 +1,10 @@
 # ngx_http_scheme_module
 
 Run Scheme inside nginx like lua-nginx-module.  The module embeds the [dummyscheme](https://github.com/zhuzhonghua/dummyscheme)
-and exposes a `content_by_scheme` directive that evaluates
-inline Scheme source and sends the response body via the host function `ngx-say`.
+and exposes `content_by_scheme`, `access_by_scheme` and `log_by_scheme`
+directives that evaluate inline Scheme source in nginx's content, access and
+log phases.  The content script sends the response body via the host
+function `ngx-say`.
 A second host function, `ngx-log`, writes log messages to nginx's error log;
 `ngx-status` / `ngx-exit` control the response status,
 `ngx-header-ref` / `ngx-header-set!` read and write response headers, and
@@ -13,9 +15,10 @@ commands array + create/merge loc_conf + content handler).  It is a generic
 third-party nginx module; the host scheme interpreter is a separate project
 and is linked in as a dependency.
 
-Two directives are provided: `content_by_scheme` (content phase) and
-`access_by_scheme` (access phase, for auth).  Both take inline Scheme source
-and both are compiled once per location.
+Three directives are provided: `content_by_scheme` (content phase),
+`access_by_scheme` (access phase, for auth) and `log_by_scheme` (log phase,
+for request logging).  All three take inline Scheme source and all are
+compiled once per location.
 
 ### Build
 
@@ -95,6 +98,33 @@ no response body.  Like `content_by_scheme`, the source is compiled once per
 location and reused across requests; the environment is separate from the
 content script's, so values should be passed through `ngx-var-ref` or
 request headers rather than top-level variables.
+
+## log_by_scheme
+
+**syntax:** `log_by_scheme '<scheme>';`
+
+Runs the scheme source in nginx's log phase, after the response has been
+sent.  It is meant for request logging and cannot change the response:
+
+```nginx
+location /logged {
+    content_by_scheme '(ngx-say "ok")';
+    log_by_scheme '(ngx-log ngx-info "status=" (ngx-var-ref "status")
+                             " uri=" (ngx-var-ref "request_uri")
+                             " bytes=" (ngx-var-ref "bytes_sent"))';
+}
+```
+
+```sh
+curl http://127.0.0.1:8080/logged   # -> ok
+tail -n 1 /path/to/error.log        # ... [scheme]: status=200 uri=/logged bytes=2
+```
+
+At this point request/response variables such as `status`, `request_time`,
+`bytes_sent` and `sent_http_*` have their final values, so a log line can be
+assembled entirely in Scheme.  A scheme error is written to error_log and
+otherwise ignored (the response has already been sent); `(ngx-exit N)` only
+stops the script, and `ngx-say` output is discarded.
 
 ## ngx-log
 
