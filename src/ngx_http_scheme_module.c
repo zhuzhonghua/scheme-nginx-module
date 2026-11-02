@@ -7,7 +7,8 @@
  *       `content_by_scheme` -- the response content handler
  *       `access_by_scheme`  -- an access-phase handler for auth / filtering
  *       `log_by_scheme`     -- a log-phase handler for request logging
- *   - all handlers create a per-request VM (see ngx_scheme_runtime)
+ *   - all handlers use a per-request handle over the worker's shared VM
+ *     (see ngx_scheme_runtime)
  *   - the classic content-module layout (module struct + commands array +
  *     create/merge loc_conf + content handler)
  *

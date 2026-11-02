@@ -1,9 +1,11 @@
 /*
  * ngx_scheme_runtime.cpp -- C bridge over the dummyscheme VM.
  *
- * Owns one VM per request.  Output follows the model :
+ * The interpreter is one shared VM per worker process; each handler
+ * invocation (content / access / log) gets a small per-request handle that
+ * binds the request to that VM.  Output follows the model:
  * the scheme code calls the host function `ngx-say` to hand strings to
- * nginx, which appends them to a per-request buffer and sends that buffer as
+ * nginx, which appends them to a per-handle buffer and sends that buffer as
  * the response body.  The VM's own IO streams (display/write -> stderr) are
  * never touched.
  *

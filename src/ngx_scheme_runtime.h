@@ -21,10 +21,13 @@
  * carries no per-feature fields: adding a new ngx-* function normally means
  * touching only that function, not the handle or the C API.
  *
- * Lifetime model (MVP): one VM is created per request and destroyed when
- * the request finishes.  A worker may run many requests concurrently and
- * the VM is not thread-safe, hence the per-request isolation.  (Future:
- * a per-worker VM with coroutine multiplexing.)
+ * Lifetime model: one VM per worker process, created lazily on the first
+ * request (after fork) and never destroyed (worker exit reclaims it).  Every
+ * handler invocation creates a small per-request handle, points the VM's
+ * registry context at it, and frees it when that phase finishes.  The VM is
+ * not thread-safe, but nginx runs a worker single-threaded, so a per-worker
+ * VM is isolated by the event loop.  (Future: coroutine multiplexing on top
+ * of the same worker-level VM.)
  */
 #ifndef NGX_SCHEME_RUNTIME_H
 #define NGX_SCHEME_RUNTIME_H
@@ -46,19 +49,23 @@ extern "C" {
 extern "C" {
 #endif
 
-/* opaque per-request scheme VM handle */
+/* opaque per-request handle over the worker's shared VM */
 typedef struct ngx_scheme_vm_s ngx_scheme_vm_t;
 
 /*
- * Create a fresh scheme VM bound to request `r`.  The handle keeps only the
- * request pointer: ngx-log writes to r->connection->log, and response state
- * (status, headers, ...) is read/written through the request itself, so new
- * scheme functions do not add fields here.  Returns NULL on failure.
+ * Create a per-request handle bound to `r`.  The interpreter itself is the
+ * worker's shared VM; this call only allocates the handle (VM pointer,
+ * request pointer, output buffer) and points the VM registry context at it.
+ * The handle keeps only the request pointer: ngx-log writes to
+ * r->connection->log, and response state (status, headers, ...) is
+ * read/written through the request itself, so new scheme functions do not
+ * add fields here.  Returns NULL on failure.
  */
 ngx_scheme_vm_t *ngx_scheme_create(ngx_http_request_t *r);
 
 /*
- * Destroy the VM and release every resource it owns.
+ * Release the per-request handle and the resources it owns (the output
+ * buffer).  The worker's shared VM is not touched.
  *
  * Returns 0 on success.  On a teardown failure returns -1 and writes a
  * NUL-terminated message into err/err_cap (if err_cap > 0), so the caller
