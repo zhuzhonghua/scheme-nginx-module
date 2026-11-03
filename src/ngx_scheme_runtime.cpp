@@ -1,9 +1,10 @@
 /*
- * ngx_scheme_runtime.cpp -- C bridge over the dummyscheme VM.
+ * ngx_scheme_runtime.cpp -- C++ bridge over the dummyscheme VM.
  *
  * The interpreter is one shared VM per worker process; each handler
  * invocation (content / access / log) gets a small per-request handle that
- * binds the request to that VM.  Output follows the model:
+ * binds the request to that VM and is released when the handler returns.
+ * Output follows the model:
  * the scheme code calls the host function `ngx-say` to hand strings to
  * nginx, which appends them to a per-handle buffer and sends that buffer as
  * the response body.  The VM's own IO streams (display/write -> stderr) are
@@ -14,6 +15,9 @@
  * context via scm_registry_get + scm_to_lightuserdata. The response buffer
  * is owned by this handle (plain growing buffer); the final body is copied into the nginx
  * request pool by the content handler.
+ *
+ * The whole bridge lives in the NgxSchemeRuntime class declared in
+ * ngx_scheme_runtime.h; the module calls its static members directly.
  *
  * This file talks to the interpreter through the public API (vm.h, which
  * includes scmapi.h) only.
@@ -32,15 +36,6 @@ using namespace Scheme;
 
 /* registry key buffer for per-location cached values ("~code-%p" / "~env-%p") */
 #define NGX_SCHEME_CACHE_KEY_LEN 64
-
-/* growing byte buffer; used for the response body and for assembling
- * ngx-log messages */
-struct ngx_scheme_buf_s {
-  char *data;
-  int   len;
-  int   cap;
-};
-typedef struct ngx_scheme_buf_s ngx_scheme_buf_t;
 
 /* make sure `add` more bytes fit, growing the buffer if needed */
 static void
@@ -64,7 +59,8 @@ ngx_scheme_buf_reserve(ngx_scheme_buf_s *b, int add)
 }
 
 static void
-ngx_scheme_buf_append(ngx_scheme_buf_s *b, const char *s, int n)
+ngx_scheme_buf_append(ngx_scheme_buf_s *b, const char *s,
+    int n)
 {
   if (n <= 0) {
     return;
@@ -77,7 +73,8 @@ ngx_scheme_buf_append(ngx_scheme_buf_s *b, const char *s, int n)
 /* append one value with ngx-say semantics: strings verbatim, anything else
  * via write semantics */
 static void
-ngx_scheme_buf_append_value(ngx_scheme_buf_s *b, VM *vm, ValueT *p)
+ngx_scheme_buf_append_value(ngx_scheme_buf_s *b, VM *vm,
+    ValueT *p)
 {
   int n = 0;
   const char *s = scm_is_string(vm, p) ? scm_get_string(vm, p, &n)
@@ -85,42 +82,11 @@ ngx_scheme_buf_append_value(ngx_scheme_buf_s *b, VM *vm, ValueT *p)
   ngx_scheme_buf_append(b, s, n);
 }
 
-static void
-ngx_scheme_buf_free(ngx_scheme_buf_s *b)
-{
-  free(b->data);
-  b->data = NULL;
-  b->len = 0;
-  b->cap = 0;
-}
-
-/* RAII guard for a local buffer: frees it on every exit path (normal return
- * or throw), so callers never need try/catch for temporary buffers */
-struct ngx_scheme_buf_guard_s {
-  ngx_scheme_buf_t b;
-
-  ngx_scheme_buf_guard_s() {
-    b.data = NULL;
-    b.len = 0;
-    b.cap = 0;
-  }
-  ~ngx_scheme_buf_guard_s() {
-    ngx_scheme_buf_free(&b);
-  }
-};
-typedef struct ngx_scheme_buf_guard_s ngx_scheme_buf_guard_t;
-
-struct ngx_scheme_vm_s {
-  VM                 *vm;   /* the interpreter (created via scm_create_vm) */
-  ngx_http_request_t *r;    /* request this VM serves; also holds the log */
-  ngx_scheme_buf_t    out;  /* response body accumulated via ngx-say */
-};
-
 /*
  * Control-flow-only exception thrown by (ngx-exit ...).  It carries the exit
- * status and unwinds out of the interpreter's eval loop; ngx_scheme_eval()
- * catches it and turns it into its return value, where it means "success,
- * script aborted on purpose" rather than an error.
+ * status and unwinds out of the interpreter's eval loop; eval() catches it
+ * and turns it into its return value, where it means "success, script
+ * aborted on purpose" rather than an error.
  */
 struct ngx_scheme_exit_signal {
   int status;
@@ -129,14 +95,14 @@ struct ngx_scheme_exit_signal {
 };
 
 /* resolve the request handle stored in the VM registry */
-static ngx_scheme_vm_s *
+NgxSchemeVMHandle *
 ngx_scheme_get_ctx(VM *vm)
 {
   ValueT ctx = scm_registry_get(vm, NGX_SCHEME_CTX_KEY);
   if (!scm_is_lightuserdata(vm, &ctx)) {
     throw "no request context";
   }
-  return (ngx_scheme_vm_s *) scm_to_lightuserdata(vm, &ctx);
+  return (NgxSchemeVMHandle *) scm_to_lightuserdata(vm, &ctx);
 }
 
 /*
@@ -148,7 +114,7 @@ ngx_scheme_get_ctx(VM *vm)
 static ValueT
 ngx_scheme_stub_log(VM* vm, ValueT* rest)
 {
-  ngx_scheme_vm_s *h = ngx_scheme_get_ctx(vm);
+  NgxSchemeVMHandle*h = ngx_scheme_get_ctx(vm);
 
   if (scm_is_null(vm, rest)) {
     scm_error(vm, "ngx-log: expected integer log level, got no argument");
@@ -165,37 +131,37 @@ ngx_scheme_stub_log(VM* vm, ValueT* rest)
   }
 
   /* skip assembling the message when the configured level filters it out */
-  if ((ngx_uint_t) level > h->r->connection->log->log_level) {
+  if ((ngx_uint_t) level > h->r_->connection->log->log_level) {
     return_void();
   }
 
-  /* msg is a local temporary buffer: the RAII guard frees it on every exit
+  /* msg is a local temporary buffer: its own dtor frees it on every exit
      path (normal or throw), so no try/catch is needed */
-  ngx_scheme_buf_guard_t msg;
+  ngx_scheme_buf_t msg;
 
   rest = scm_cdr(vm, rest);
   while (!scm_is_null(vm, rest)) {
-    ngx_scheme_buf_append_value(&msg.b, vm, scm_car(vm, rest));
+    ngx_scheme_buf_append_value(&msg, vm, scm_car(vm, rest));
     rest = scm_cdr(vm, rest);
   }
-  ngx_log_error((ngx_uint_t) level, h->r->connection->log, 0, "[scheme]: %s",
-      msg.b.data != NULL ? msg.b.data : "");
+  ngx_log_error((ngx_uint_t) level, h->r_->connection->log, 0, "[scheme]: %s",
+      msg.data != NULL ? msg.data : "");
   return_void();
 }
 
 /*
  * The ngx-say host function: converts every argument to a string and appends
  * it to the request's output buffer.  Accepts any number of arguments.  No
- * try/catch here: values go straight into h->out, which the handle owns and
+ * try/catch here: values go straight into h->out_, which the handle owns and
  * destroy() releases even if appending throws.
  */
 static ValueT
 ngx_scheme_stub_say(VM* vm, ValueT* rest)
 {
-  ngx_scheme_vm_s *h = ngx_scheme_get_ctx(vm);
+  NgxSchemeVMHandle*h = ngx_scheme_get_ctx(vm);
 
   while (!scm_is_null(vm, rest)) {
-    ngx_scheme_buf_append_value(&h->out, vm, scm_car(vm, rest));
+    ngx_scheme_buf_append_value(&h->out_, vm, scm_car(vm, rest));
     rest = scm_cdr(vm, rest);
   }
 
@@ -205,7 +171,8 @@ ngx_scheme_stub_say(VM* vm, ValueT* rest)
 /* fetch an integer argument: an integer, or a string that parses as one
  * (numeric strings are accepted); anything else raises a scheme error */
 static scm_int
-ngx_scheme_int_arg(VM *vm, ValueT *p, const char *who, const char *what)
+ngx_scheme_int_arg(VM *vm, ValueT *p, const char *who,
+    const char *what)
 {
   if (scm_is_int(vm, p)) {
     return scm_get_int(vm, p);
@@ -244,7 +211,8 @@ ngx_scheme_is_status_key(ValueT *key)
  * normal "undefined global var" error.
  */
 static ValueT
-ngx_scheme_stub_status_index(VM* vm, ValueT* tbl, ValueT* key)
+ngx_scheme_status_index(VM* vm, ValueT* tbl,
+    ValueT* key)
 {
   (void) tbl;
 
@@ -252,9 +220,9 @@ ngx_scheme_stub_status_index(VM* vm, ValueT* tbl, ValueT* key)
     return *Sundefined;
   }
 
-  ngx_scheme_vm_s *h = ngx_scheme_get_ctx(vm);
-  ngx_uint_t st = h->r->err_status != 0 ? h->r->err_status
-                                        : h->r->headers_out.status;
+  NgxSchemeVMHandle*h = ngx_scheme_get_ctx(vm);
+  ngx_uint_t st = h->r_->err_status != 0 ? h->r_->err_status
+                                        : h->r_->headers_out.status;
   return scm_make_int(vm, (scm_int) st);
 }
 
@@ -267,7 +235,8 @@ ngx_scheme_stub_status_index(VM* vm, ValueT* tbl, ValueT* key)
  * normal insertion path.
  */
 static ValueT
-ngx_scheme_stub_status_newindex(VM* vm, ValueT* tbl, ValueT* key, ValueT* val)
+ngx_scheme_status_newindex(VM* vm, ValueT* tbl,
+    ValueT* key, ValueT* val)
 {
   (void) tbl;
 
@@ -275,19 +244,19 @@ ngx_scheme_stub_status_newindex(VM* vm, ValueT* tbl, ValueT* key, ValueT* val)
     return scm_make_bool(vm, false);
   }
 
-  ngx_scheme_vm_s *h = ngx_scheme_get_ctx(vm);
+  NgxSchemeVMHandle*h = ngx_scheme_get_ctx(vm);
   scm_int status = ngx_scheme_int_arg(vm, val, "ngx-status", "HTTP status");
 
   /* the status line must be 3 digits (RFC 7230 sec 3.1.2) */
   if (status < 100 || status > 999) {
-    ngx_log_error(NGX_LOG_ERR, h->r->connection->log, 0,
+    ngx_log_error(NGX_LOG_ERR, h->r_->connection->log, 0,
         "invalid HTTP status code %d", (int) status);
     return_void();
   }
 
-  h->r->headers_out.status = (ngx_uint_t) status;
-  h->r->err_status = 0;
-  h->r->headers_out.status_line.len = 0;
+  h->r_->headers_out.status = (ngx_uint_t) status;
+  h->r_->err_status = 0;
+  h->r_->headers_out.status_line.len = 0;
   return_void();
 }
 
@@ -296,13 +265,13 @@ ngx_scheme_stub_status_newindex(VM* vm, ValueT* tbl, ValueT* key, ValueT* val)
  * the script.  A status of 0 means "stop now, keep the default 200"; any
  * other integer is used as-is (no range check, so nginx's special codes
  * like 444 work).  Aborting is done by throwing a control-flow exception
- * caught in ngx_scheme_eval(), so the rest of the scheme code (including
+ * caught in eval(), so the rest of the scheme code (including
  * later ngx-say/ngx-log calls) does not run.
  */
 static ValueT
 ngx_scheme_stub_exit(VM* vm, ValueT* statusp)
 {
-  ngx_scheme_vm_s *h = ngx_scheme_get_ctx(vm);
+  NgxSchemeVMHandle*h = ngx_scheme_get_ctx(vm);
 
   if (!scm_is_int(vm, statusp)) {
     scm_error(vm, "ngx-exit: expected integer HTTP status, got %s",
@@ -314,7 +283,7 @@ ngx_scheme_stub_exit(VM* vm, ValueT* statusp)
 
   if (status != 0) {
     exit_status = (int) status;
-    h->r->headers_out.status = (ngx_uint_t) exit_status;
+    h->r_->headers_out.status = (ngx_uint_t) exit_status;
   }
 
   throw ngx_scheme_exit_signal(exit_status);
@@ -333,8 +302,8 @@ ngx_scheme_stub_exit(VM* vm, ValueT* statusp)
 
 /* lower-case a scheme header name into dst; returns its length */
 static int
-ngx_scheme_header_name(VM *vm, ValueT *p, u_char *dst, size_t cap,
-    const char *who)
+ngx_scheme_header_name(VM *vm, ValueT *p, u_char *dst,
+    size_t cap, const char *who)
 {
   const char *s;
   int n;
@@ -368,7 +337,8 @@ ngx_scheme_header_name(VM *vm, ValueT *p, u_char *dst, size_t cap,
 
 /* look up a live response header by its already-lowercased name */
 static ngx_table_elt_t *
-ngx_scheme_header_find(ngx_http_request_t *r, const u_char *name, size_t len)
+ngx_scheme_header_find(ngx_http_request_t *r,
+    const u_char *name, size_t len)
 {
   ngx_list_part_t *part;
   ngx_table_elt_t *h;
@@ -404,8 +374,8 @@ ngx_scheme_header_find(ngx_http_request_t *r, const u_char *name, size_t len)
 
 /* copy a scheme value into the request pool as an nginx string */
 static void
-ngx_scheme_header_copy_value(VM *vm, ValueT *p, ngx_pool_t *pool,
-    ngx_str_t *out)
+ngx_scheme_header_copy_value(VM *vm, ValueT *p,
+    ngx_pool_t *pool, ngx_str_t *out)
 {
   int n = 0;
   const char *s = scm_is_string(vm, p) ? scm_get_string(vm, p, &n)
@@ -431,8 +401,8 @@ ngx_scheme_header_copy_value(VM *vm, ValueT *p, ngx_pool_t *pool,
 
 /* append a new header entry; the key is copied into the request pool */
 static ngx_table_elt_t *
-ngx_scheme_header_add(ngx_http_request_t *r, const u_char *name, size_t len,
-    ngx_str_t *value)
+ngx_scheme_header_add(ngx_http_request_t *r,
+    const u_char *name, size_t len, ngx_str_t *value)
 {
   u_char *key;
   ngx_table_elt_t *h;
@@ -466,7 +436,7 @@ ngx_scheme_header_add(ngx_http_request_t *r, const u_char *name, size_t len,
 static ValueT
 ngx_scheme_stub_header_ref(VM *vm, ValueT *namep)
 {
-  ngx_scheme_vm_s *h = ngx_scheme_get_ctx(vm);
+  NgxSchemeVMHandle*h = ngx_scheme_get_ctx(vm);
   u_char name[NGX_SCHEME_HEADER_NAME_MAX] = {0};
   int nlen = ngx_scheme_header_name(vm, namep, name, sizeof(name),
       "ngx-header-ref");
@@ -474,27 +444,27 @@ ngx_scheme_stub_header_ref(VM *vm, ValueT *namep)
   if (nlen == (int) (sizeof("content-type") - 1)
       && ngx_strncmp(name, "content-type", nlen) == 0)
   {
-    if (h->r->headers_out.content_type.len == 0) {
+    if (h->r_->headers_out.content_type.len == 0) {
       return scm_make_bool(vm, false);
     }
     return scm_make_string(vm,
-        (const char *) h->r->headers_out.content_type.data,
-        (int) h->r->headers_out.content_type.len);
+        (const char *) h->r_->headers_out.content_type.data,
+        (int) h->r_->headers_out.content_type.len);
   }
 
   if (nlen == (int) (sizeof("content-length") - 1)
       && ngx_strncmp(name, "content-length", nlen) == 0)
   {
-    if (h->r->headers_out.content_length_n < 0) {
+    if (h->r_->headers_out.content_length_n < 0) {
       return scm_make_bool(vm, false);
     }
     char buf[NGX_INT_T_LEN];
     int n = snprintf(buf, sizeof(buf), "%lld",
-        (long long) h->r->headers_out.content_length_n);
+        (long long) h->r_->headers_out.content_length_n);
     return scm_make_string(vm, buf, n);
   }
 
-  ngx_table_elt_t *hdr = ngx_scheme_header_find(h->r, name, (size_t) nlen);
+  ngx_table_elt_t *hdr = ngx_scheme_header_find(h->r_, name, (size_t) nlen);
   if (hdr == NULL) {
     return scm_make_bool(vm, false);
   }
@@ -513,10 +483,11 @@ ngx_scheme_stub_header_ref(VM *vm, ValueT *namep)
  * it.
  */
 static ValueT
-ngx_scheme_stub_header_set(VM *vm, ValueT *namep, ValueT *valp)
+ngx_scheme_stub_header_set(VM *vm, ValueT *namep,
+    ValueT *valp)
 {
-  ngx_scheme_vm_s *h = ngx_scheme_get_ctx(vm);
-  ngx_http_request_t *r = h->r;
+  NgxSchemeVMHandle*h = ngx_scheme_get_ctx(vm);
+  ngx_http_request_t *r = h->r_;
   u_char name[NGX_SCHEME_HEADER_NAME_MAX] = {0};
   int nlen = ngx_scheme_header_name(vm, namep, name, sizeof(name),
       "ngx-header-set!");
@@ -603,7 +574,7 @@ ngx_scheme_stub_header_set(VM *vm, ValueT *namep, ValueT *valp)
 static ValueT
 ngx_scheme_stub_var_ref(VM *vm, ValueT *namep)
 {
-  ngx_scheme_vm_s *h = ngx_scheme_get_ctx(vm);
+  NgxSchemeVMHandle*h = ngx_scheme_get_ctx(vm);
   const char *s;
   int n;
 
@@ -632,7 +603,7 @@ ngx_scheme_stub_var_ref(VM *vm, ValueT *namep)
   vname.data = name;
   vname.len = (size_t) n;
 
-  ngx_http_variable_value_t *vv = ngx_http_get_variable(h->r, &vname,
+  ngx_http_variable_value_t *vv = ngx_http_get_variable(h->r_, &vname,
       ngx_hash_key_lc(name, (size_t) n));
 
   if (vv == NULL || vv->not_found) {
@@ -773,8 +744,8 @@ ngx_scheme_acquire_vm()
        metatable callbacks built here (native procs that never reach genv) */
     Sgcvar4(vm, mt, mk, iv, nv);
     *mt = scm_make_table(vm);
-    *iv = scm_make_native_proc(vm, RegCProc(NGX_SCHEME_STATUS_INDEX_PROC, ngx_scheme_stub_status_index));
-    *nv = scm_make_native_proc(vm, RegCProc(NGX_SCHEME_STATUS_NEWINDEX_PROC, ngx_scheme_stub_status_newindex));
+    *iv = scm_make_native_proc(vm, RegCProc(NGX_SCHEME_STATUS_INDEX_PROC, ngx_scheme_status_index));
+    *nv = scm_make_native_proc(vm, RegCProc(NGX_SCHEME_STATUS_NEWINDEX_PROC, ngx_scheme_status_newindex));
     /* keep one shared instance of each callback in the registry; per-location
        env metatables fetch them from there instead of building new procs */
     scm_registry_set(vm, NGX_SCHEME_STATUS_INDEX_PROC, *iv);
@@ -797,71 +768,37 @@ ngx_scheme_acquire_vm()
   return vm;
 }
 
-ngx_scheme_vm_t *
-ngx_scheme_create(ngx_http_request_t *r)
+NgxSchemeVMHandle::NgxSchemeVMHandle(ngx_http_request_t *r)
+    : vm_(NULL), r_(r), out_()
 {
-  ngx_scheme_vm_t *h = (ngx_scheme_vm_t *) malloc(sizeof(*h));
-  if (h == NULL) {
-    return NULL;
-  }
-
-  h->vm = NULL;
-  h->r = r;
-  h->out.data = NULL;
-  h->out.len = 0;
-  h->out.cap = 0;
-
   try {
-    h->vm = ngx_scheme_acquire_vm();
-    if (h->vm == NULL) {
-      free(h);
-      return NULL;
+    vm_ = ngx_scheme_acquire_vm();
+    if (vm_ == NULL) {
+      return;  /* ok() reports failure; caller checks */
     }
-
-    /* register this handle as a lightuserdata in the VM registry; the VM is
-       shared, so every request re-points the context at its own handle */
-    scm_registry_set(h->vm, NGX_SCHEME_CTX_KEY,
-        scm_make_lightuserdata(h->vm, h));
+    scm_registry_set(vm_, NGX_SCHEME_CTX_KEY,
+        scm_make_lightuserdata(vm_, this));
   }
   catch (...) {
-    free(h);
-    return NULL;
+    vm_ = NULL;  /* ensure ok() reports failure */
   }
-
-  return h;
 }
 
-static void
-ngx_scheme_free(ngx_scheme_vm_s *h)
+NgxSchemeVMHandle::~NgxSchemeVMHandle()
 {
-  if (h == NULL) {
-    return;
+  if (vm_ != NULL) {
+    /* tear the slot first so stubs can no longer reach this handle even if
+       the VM outlives us */
+    scm_registry_unset(vm_, NGX_SCHEME_CTX_KEY);
   }
-  ngx_scheme_buf_free(&h->out);
-  free(h);
+  /* out_ is destroyed here; its dtor frees the response buffer */
 }
 
 int
-ngx_scheme_destroy(ngx_scheme_vm_t *h, char *err, int err_cap)
+NgxSchemeVMHandle::eval(const char *code, int len, char *err,
+    int err_cap)
 {
-  if (err_cap > 0) {
-    err[0] = '\0';
-  }
-  if (h == NULL) {
-    return 0;  /* nothing owned, nothing to tear down */
-  }
-
-  /* the VM is shared and outlives the request; only the per-request handle
-     and its output buffer are released */
-  ngx_scheme_free(h);
-  return 0;
-}
-
-int
-ngx_scheme_eval(ngx_scheme_vm_t *h, const char *code, int len,
-                char *err, int err_cap)
-{
-  if (h == NULL || h->vm == NULL) {
+  if (vm_ == NULL) {
     return -1;
   }
 
@@ -870,48 +807,37 @@ ngx_scheme_eval(ngx_scheme_vm_t *h, const char *code, int len,
   }
 
   try {
-    /* compile once per location script into a per-location sandbox env and
-       cache both in the registry for the VM's lifetime; requests just apply
-       the cached closure.  define/set! write into the env (not visible from
-       other locations or genv), reads fall back to genv */
     char code_key[NGX_SCHEME_CACHE_KEY_LEN] = {0};
     char env_key[NGX_SCHEME_CACHE_KEY_LEN] = {0};
     snprintf(code_key, sizeof(code_key), "~code-%p", (const void *) code);
     snprintf(env_key, sizeof(env_key), "~env-%p", (const void *) code);
 
-    Sgcvar2(h->vm, fv, envv);
-    *fv = scm_registry_get(h->vm, code_key);
-    if (scm_is_null(h->vm, fv)) {
-      *envv = scm_make_table(h->vm);
-      *fv = scm_compile(h->vm, envv, code, len);
+    Sgcvar2(vm_, fv, envv);
+    *fv = scm_registry_get(vm_, code_key);
+    if (scm_is_null(vm_, fv)) {
+      *envv = scm_make_table(vm_);
+      *fv = scm_compile(vm_, envv, code, len);
 
-      /* scm_compile installs {__index = genv} on the env; add the shared
-         ngx-status __newindex callback so (set! ngx-status ...) still reaches
-         the request instead of being swallowed by the env */
-      Sgcvar2(h->vm, niv, nik);
-      *niv = scm_registry_get(h->vm, NGX_SCHEME_STATUS_NEWINDEX_PROC);
-      *nik = scm_make_string(h->vm, "__newindex");
-      hashtableref(hashtableref(envv)->getmetatable())->set(h->vm, nik, niv);
+      Sgcvar2(vm_, niv, nik);
+      *niv = scm_registry_get(vm_, NGX_SCHEME_STATUS_NEWINDEX_PROC);
+      *nik = scm_make_string(vm_, "__newindex");
+      hashtableref(hashtableref(envv)->getmetatable())->set(vm_, nik, niv);
 
-      scm_registry_set(h->vm, env_key, *envv);
-      scm_registry_set(h->vm, code_key, *fv);
+      scm_registry_set(vm_, env_key, *envv);
+      scm_registry_set(vm_, code_key, *fv);
     }
 
     ValueT result;
-    if (!scm_apply(h->vm, fv, NULL, 0, &result)) {
-      /* scm_apply reports a scheme error as the result string */
+    if (!scm_apply(vm_, fv, NULL, 0, &result)) {
       if (err_cap > 0) {
         int n = 0;
-        const char *msg = scm_get_string(h->vm, &result, &n);
+        const char *msg = scm_get_string(vm_, &result, &n);
         snprintf(err, err_cap, "scheme error: %s", msg != NULL ? msg : "unknown");
       }
       return -1;
     }
   }
   catch (const ngx_scheme_exit_signal &e) {
-    /* (ngx-exit N) aborted the script; that is not an error.  Statuses >= 300
-     * are reported back so the caller can let nginx emit its error page; the
-     * rest are a normal response and collapse to NGX_OK. */
     return e.status >= NGX_HTTP_SPECIAL_RESPONSE ? e.status : NGX_OK;
   }
   catch (const char *e) {
@@ -932,7 +858,7 @@ ngx_scheme_eval(ngx_scheme_vm_t *h, const char *code, int len,
 }
 
 void
-ngx_scheme_output(ngx_scheme_vm_t *h, const char **data, int *len)
+NgxSchemeVMHandle::output(const char **data, int *len) const
 {
   if (data != NULL) {
     *data = NULL;
@@ -940,15 +866,10 @@ ngx_scheme_output(ngx_scheme_vm_t *h, const char **data, int *len)
   if (len != NULL) {
     *len = 0;
   }
-
-  if (h == NULL) {
-    return;
-  }
-
   if (data != NULL) {
-    *data = h->out.data;
+    *data = out_.data;
   }
   if (len != NULL) {
-    *len = h->out.len;
+    *len = out_.len;
   }
 }

@@ -52,16 +52,17 @@ SCHEME_CORE_SRCS=" \
     $SCHEME_CORE_DIR/scmvector.cpp \
     $SCHEME_CORE_DIR/scmtable.cpp \
     $SCHEME_CORE_DIR/scminit.cpp \
+    $SCHEME_CORE_DIR/scmdebug.cpp \
 "
 
 HTTP_SCHEME_SRCS=" \
-    $ngx_addon_dir/src/ngx_http_scheme_module.c \
+    $ngx_addon_dir/src/ngx_http_scheme_module.cpp \
     $ngx_addon_dir/src/ngx_scheme_runtime.cpp \
     $SCHEME_CORE_SRCS \
 "
 
 HTTP_SCHEME_DEPS=" \
-    $ngx_addon_dir/src/ngx_http_scheme_module.c \
+    $ngx_addon_dir/src/ngx_http_scheme_module.cpp \
     $ngx_addon_dir/src/ngx_scheme_runtime.h \
     $ngx_addon_dir/src/ngx_scheme_runtime.cpp \
     $SCHEME_CORE_SRCS \
@@ -72,6 +73,12 @@ NGX_ADDON_SRCS="$NGX_ADDON_SRCS $HTTP_SCHEME_SRCS"
 NGX_ADDON_DEPS="$NGX_ADDON_DEPS $HTTP_SCHEME_DEPS"
 
 CORE_INCS="$CORE_INCS $SCHEME_CORE_DIR $ngx_addon_dir/src"
+
+# nginx compiles addon sources with its own CFLAGS, which carry -Werror.
+# The scheme core is C++ and is warning-clean under its own build, not
+# necessarily under nginx's C warning set, so demote warnings to keep the
+# traditional add-on build working.
+CFLAGS="$CFLAGS -Wno-error"
 
 # C++ runtime for the scheme core.  There is no single "C++ standard
 # library": it is a different library per toolchain -- Apple's libc++ on

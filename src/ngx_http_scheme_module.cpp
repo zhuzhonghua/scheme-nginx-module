@@ -1,16 +1,19 @@
 /*
- * ngx_http_scheme_module -- run Scheme (the dummyscheme VM, see vm.h of the
- * host project) inside nginx.
+ * ngx_http_scheme_module.cpp -- run Scheme (the dummyscheme VM, see vm.h of
+ * the host project) inside nginx.
  *
  * A generic NGX_HTTP_MODULE with location-scoped config:
  *   - three directives taking scheme source inline:
  *       `content_by_scheme` -- the response content handler
  *       `access_by_scheme`  -- an access-phase handler for auth / filtering
  *       `log_by_scheme`     -- a log-phase handler for request logging
- *   - all handlers use a per-request handle over the worker's shared VM
- *     (see ngx_scheme_runtime)
+ *   - each handler creates a short-lived per-request handle over the
+ *     worker's shared VM and destroys it before returning
+ *     (see ngx_scheme_runtime.h)
  *   - the classic content-module layout (module struct + commands array +
- *     create/merge loc_conf + content handler)
+ *     create/merge loc_conf + handlers) is kept as file-scope statics; only
+ *     `ngx_http_scheme_module` itself has external linkage because nginx's
+ *     generated module list references that symbol by name.
  *
  * Example:
  *
@@ -30,9 +33,15 @@
  *       log_by_scheme '(ngx-log ngx-info "status=" (ngx-var-ref "status"))';
  *   }
  */
+
+/* nginx headers are C: keep their declarations unmangled so the objects
+ * produced from nginx's own C sources link against this C++ translation
+ * unit. */
+extern "C" {
 #include <ngx_config.h>
 #include <ngx_core.h>
 #include <ngx_http.h>
+}
 
 #include "ngx_scheme_runtime.h"
 
@@ -47,7 +56,7 @@ typedef struct {
   ngx_flag_t  log_enabled;
 } ngx_http_scheme_loc_conf_t;
 
-static ngx_int_t ngx_http_scheme_handler(ngx_http_request_t *r);
+static ngx_int_t ngx_http_scheme_content_handler(ngx_http_request_t *r);
 static ngx_int_t ngx_http_scheme_access_handler(ngx_http_request_t *r);
 static ngx_int_t ngx_http_scheme_log_handler(ngx_http_request_t *r);
 
@@ -90,7 +99,7 @@ static ngx_command_t  ngx_http_scheme_commands[] = {
 
 static ngx_http_module_t  ngx_http_scheme_module_ctx = {
   NULL,                                  /* preconfiguration */
-  ngx_http_scheme_init,                  /* postconfiguration */
+  ngx_http_scheme_init, /* postconfiguration */
 
   NULL,                                  /* create main configuration */
   NULL,                                  /* init main configuration */
@@ -98,14 +107,20 @@ static ngx_http_module_t  ngx_http_scheme_module_ctx = {
   NULL,                                  /* create server configuration */
   NULL,                                  /* merge server configuration */
 
-  ngx_http_scheme_create_loc_conf,       /* create location configuration */
-  ngx_http_scheme_merge_loc_conf         /* merge location configuration */
+  ngx_http_scheme_create_loc_conf,
+                                         /* create location configuration */
+  ngx_http_scheme_merge_loc_conf
+                                         /* merge location configuration */
 };
 
-ngx_module_t  ngx_http_scheme_module = {
+/* nginx looks this symbol up from its generated module list, so it keeps C
+ * linkage even though the implementation is C++. */
+extern "C" ngx_module_t  ngx_http_scheme_module = {
   NGX_MODULE_V1,
-  &ngx_http_scheme_module_ctx,           /* module context */
-  ngx_http_scheme_commands,              /* module directives */
+  &ngx_http_scheme_module_ctx,
+                                         /* module context */
+  ngx_http_scheme_commands,
+                                         /* module directives */
   NGX_HTTP_MODULE,                       /* module type */
   NULL,                                  /* init master */
   NULL,                                  /* init module */
@@ -117,12 +132,13 @@ ngx_module_t  ngx_http_scheme_module = {
   NGX_MODULE_V1_PADDING
 };
 
-static void *
+void *
 ngx_http_scheme_create_loc_conf(ngx_conf_t *cf)
 {
   ngx_http_scheme_loc_conf_t  *conf;
 
-  conf = ngx_pcalloc(cf->pool, sizeof(ngx_http_scheme_loc_conf_t));
+  conf = (ngx_http_scheme_loc_conf_t *)
+      ngx_pcalloc(cf->pool, sizeof(ngx_http_scheme_loc_conf_t));
   if (conf == NULL) {
     return NULL;
   }
@@ -139,11 +155,12 @@ ngx_http_scheme_create_loc_conf(ngx_conf_t *cf)
   return conf;
 }
 
-static char *
-ngx_http_scheme_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
+char *
+ngx_http_scheme_merge_loc_conf(ngx_conf_t *cf, void *parent,
+  void *child)
 {
-  ngx_http_scheme_loc_conf_t  *prev = parent;
-  ngx_http_scheme_loc_conf_t  *conf = child;
+  ngx_http_scheme_loc_conf_t  *prev = (ngx_http_scheme_loc_conf_t *) parent;
+  ngx_http_scheme_loc_conf_t  *conf = (ngx_http_scheme_loc_conf_t *) child;
 
   ngx_conf_merge_str_value(conf->code, prev->code, "");
   ngx_conf_merge_value(conf->enabled, prev->enabled, 0);
@@ -157,41 +174,42 @@ ngx_http_scheme_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
   return NGX_CONF_OK;
 }
 
-static char *
-ngx_http_scheme_content_by_scheme(ngx_conf_t *cf, ngx_command_t *cmd,
-  void *conf)
+char *
+ngx_http_scheme_content_by_scheme(ngx_conf_t *cf,
+  ngx_command_t *cmd, void *conf)
 {
   ngx_http_core_loc_conf_t   *clcf;
-  ngx_http_scheme_loc_conf_t *slcf = conf;
+  ngx_http_scheme_loc_conf_t *slcf = (ngx_http_scheme_loc_conf_t *) conf;
   ngx_str_t                  *value;
 
   if (slcf->code.len != 0) {
     return "is duplicate";
   }
 
-  value = cf->args->elts;
+  value = (ngx_str_t *) cf->args->elts;
 
   slcf->code = value[1];
   slcf->enabled = 1;
 
-  clcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
-  clcf->handler = ngx_http_scheme_handler;
+  clcf = (ngx_http_core_loc_conf_t *)
+      ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
+  clcf->handler = ngx_http_scheme_content_handler;
 
   return NGX_CONF_OK;
 }
 
-static char *
-ngx_http_scheme_access_by_scheme(ngx_conf_t *cf, ngx_command_t *cmd,
-  void *conf)
+char *
+ngx_http_scheme_access_by_scheme(ngx_conf_t *cf,
+  ngx_command_t *cmd, void *conf)
 {
-  ngx_http_scheme_loc_conf_t *slcf = conf;
+  ngx_http_scheme_loc_conf_t *slcf = (ngx_http_scheme_loc_conf_t *) conf;
   ngx_str_t                  *value;
 
   if (slcf->access_code.len != 0) {
     return "is duplicate";
   }
 
-  value = cf->args->elts;
+  value = (ngx_str_t *) cf->args->elts;
 
   slcf->access_code = value[1];
   slcf->access_enabled = 1;
@@ -199,17 +217,18 @@ ngx_http_scheme_access_by_scheme(ngx_conf_t *cf, ngx_command_t *cmd,
   return NGX_CONF_OK;
 }
 
-static char *
-ngx_http_scheme_log_by_scheme(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+char *
+ngx_http_scheme_log_by_scheme(ngx_conf_t *cf, ngx_command_t *cmd,
+  void *conf)
 {
-  ngx_http_scheme_loc_conf_t *slcf = conf;
+  ngx_http_scheme_loc_conf_t *slcf = (ngx_http_scheme_loc_conf_t *) conf;
   ngx_str_t                  *value;
 
   if (slcf->log_code.len != 0) {
     return "is duplicate";
   }
 
-  value = cf->args->elts;
+  value = (ngx_str_t *) cf->args->elts;
 
   slcf->log_code = value[1];
   slcf->log_enabled = 1;
@@ -222,21 +241,24 @@ ngx_http_scheme_log_by_scheme(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
  * phases like any other module; locations without the matching directive
  * leave the chain alone.
  */
-static ngx_int_t
+ngx_int_t
 ngx_http_scheme_init(ngx_conf_t *cf)
 {
   ngx_http_handler_pt        *h;
   ngx_http_core_main_conf_t  *cmcf;
 
-  cmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
+  cmcf = (ngx_http_core_main_conf_t *)
+      ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
 
-  h = ngx_array_push(&cmcf->phases[NGX_HTTP_ACCESS_PHASE].handlers);
+  h = (ngx_http_handler_pt *)
+      ngx_array_push(&cmcf->phases[NGX_HTTP_ACCESS_PHASE].handlers);
   if (h == NULL) {
     return NGX_ERROR;
   }
   *h = ngx_http_scheme_access_handler;
 
-  h = ngx_array_push(&cmcf->phases[NGX_HTTP_LOG_PHASE].handlers);
+  h = (ngx_http_handler_pt *)
+      ngx_array_push(&cmcf->phases[NGX_HTTP_LOG_PHASE].handlers);
   if (h == NULL) {
     return NGX_ERROR;
   }
@@ -246,25 +268,15 @@ ngx_http_scheme_init(ngx_conf_t *cf)
 }
 
 /*
- * Destroy the per-request VM and log teardown failures here, in the nginx
- * layer: the bridge reports teardown errors through its return code and
- * error buffer.
+ * Content-phase handler: runs content_by_scheme for the request body,
+ * then hands the output buffer to nginx's write chain.  Handles with
+ * fewer boilerplate: a single NgxSchemeVMHandle tears the per-request
+ * context and VM registry slot down on every exit path.
  */
-static void
-ngx_http_scheme_destroy(ngx_scheme_vm_t *svm, ngx_http_request_t *r)
-{
-  char err[128];
-
-  if (ngx_scheme_destroy(svm, err, sizeof(err)) != 0) {
-    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "[scheme]: %s", err);
-  }
-}
-
-static ngx_int_t
-ngx_http_scheme_handler(ngx_http_request_t *r)
+ngx_int_t
+ngx_http_scheme_content_handler(ngx_http_request_t *r)
 {
   ngx_http_scheme_loc_conf_t  *slcf;
-  ngx_scheme_vm_t             *svm;
   ngx_buf_t                   *b;
   ngx_chain_t                 *cl;
   const char                  *body;
@@ -272,24 +284,24 @@ ngx_http_scheme_handler(ngx_http_request_t *r)
   char                         err[256];
   ngx_int_t                    rc;
 
-  slcf = ngx_http_get_module_loc_conf(r, ngx_http_scheme_module);
+  slcf = (ngx_http_scheme_loc_conf_t *)
+      ngx_http_get_module_loc_conf(r, ngx_http_scheme_module);
 
   if (!slcf->enabled) {
     return NGX_DECLINED;
   }
 
-  svm = ngx_scheme_create(r);
-  if (svm == NULL) {
+  NgxSchemeVMHandle handle(r);
+  if (!handle.ok()) {
     ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
         "[scheme]: failed to create VM");
     return NGX_HTTP_INTERNAL_SERVER_ERROR;
   }
 
-  rc = ngx_scheme_eval(svm, (const char *) slcf->code.data, slcf->code.len,
-          err, sizeof(err));
+  rc = handle.eval((const char *) slcf->code.data, slcf->code.len,
+      err, sizeof(err));
   if (rc == NGX_ERROR) {
     ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "[scheme]: %s", err);
-    ngx_http_scheme_destroy(svm, r);
     return NGX_HTTP_INTERNAL_SERVER_ERROR;
   }
 
@@ -303,11 +315,10 @@ ngx_http_scheme_handler(ngx_http_request_t *r)
      * accumulated via ngx-say is discarded in favour of nginx's standard
      * error page.
      */
-    ngx_http_scheme_destroy(svm, r);
     return rc;
   }
 
-  ngx_scheme_output(svm, &body, &body_len);
+  handle.output(&body, &body_len);
 
   ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
       "[scheme]: body %d bytes", body_len);
@@ -332,19 +343,19 @@ ngx_http_scheme_handler(ngx_http_request_t *r)
      * with pos == last as an error ("zero size buf in writer").
      */
     r->header_only = 1;
-    ngx_http_scheme_destroy(svm, r);
+
     return ngx_http_send_header(r);
   }
 
   rc = ngx_http_send_header(r);
   if (rc == NGX_ERROR || rc > NGX_OK || r->header_only) {
-    ngx_http_scheme_destroy(svm, r);
+
     return rc;
   }
 
   b = ngx_create_temp_buf(r->pool, (size_t) body_len);
   if (b == NULL) {
-    ngx_http_scheme_destroy(svm, r);
+
     return NGX_HTTP_INTERNAL_SERVER_ERROR;
   }
   b->last = ngx_cpymem(b->pos, body, (size_t) body_len);
@@ -359,14 +370,12 @@ ngx_http_scheme_handler(ngx_http_request_t *r)
 
   cl = ngx_alloc_chain_link(r->pool);
   if (cl == NULL) {
-    ngx_http_scheme_destroy(svm, r);
+
     return NGX_HTTP_INTERNAL_SERVER_ERROR;
   }
 
   cl->buf = b;
   cl->next = NULL;
-
-  ngx_http_scheme_destroy(svm, r);
 
   return ngx_http_output_filter(r, cl);
 }
@@ -379,40 +388,37 @@ ngx_http_scheme_handler(ngx_http_request_t *r)
  * becomes 500.  Body written with ngx-say is discarded: this phase has no
  * response body.
  */
-static ngx_int_t
+ngx_int_t
 ngx_http_scheme_access_handler(ngx_http_request_t *r)
 {
   ngx_http_scheme_loc_conf_t  *slcf;
-  ngx_scheme_vm_t             *svm;
   char                         err[256];
   ngx_int_t                    rc;
 
-  slcf = ngx_http_get_module_loc_conf(r, ngx_http_scheme_module);
+  slcf = (ngx_http_scheme_loc_conf_t *)
+      ngx_http_get_module_loc_conf(r, ngx_http_scheme_module);
 
   if (!slcf->access_enabled) {
     return NGX_DECLINED;
   }
 
-  svm = ngx_scheme_create(r);
-  if (svm == NULL) {
+  NgxSchemeVMHandle handle(r);
+  if (!handle.ok()) {
     ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
         "[scheme]: failed to create VM");
     return NGX_HTTP_INTERNAL_SERVER_ERROR;
   }
 
-  rc = ngx_scheme_eval(svm, (const char *) slcf->access_code.data,
-          slcf->access_code.len, err, sizeof(err));
+  rc = handle.eval((const char *) slcf->access_code.data, slcf->access_code.len,
+      err, sizeof(err));
 
   if (rc == NGX_ERROR) {
     ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "[scheme]: %s", err);
-    ngx_http_scheme_destroy(svm, r);
     return NGX_HTTP_INTERNAL_SERVER_ERROR;
   }
 
   ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
       "[scheme]: access eval rc %i", (int) rc);
-
-  ngx_http_scheme_destroy(svm, r);
 
   if (rc >= NGX_HTTP_SPECIAL_RESPONSE) {
     return rc;
@@ -427,29 +433,29 @@ ngx_http_scheme_access_handler(ngx_http_request_t *r)
  * errors are written to error_log and otherwise ignored.  (ngx-exit N) only
  * stops the script.  Body written with ngx-say is discarded.
  */
-static ngx_int_t
+ngx_int_t
 ngx_http_scheme_log_handler(ngx_http_request_t *r)
 {
   ngx_http_scheme_loc_conf_t  *slcf;
-  ngx_scheme_vm_t             *svm;
   char                         err[256];
   ngx_int_t                    rc;
 
-  slcf = ngx_http_get_module_loc_conf(r, ngx_http_scheme_module);
+  slcf = (ngx_http_scheme_loc_conf_t *)
+      ngx_http_get_module_loc_conf(r, ngx_http_scheme_module);
 
   if (!slcf->log_enabled) {
     return NGX_OK;
   }
 
-  svm = ngx_scheme_create(r);
-  if (svm == NULL) {
+  NgxSchemeVMHandle handle(r);
+  if (!handle.ok()) {
     ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
         "[scheme]: failed to create VM");
     return NGX_OK;
   }
 
-  rc = ngx_scheme_eval(svm, (const char *) slcf->log_code.data,
-          slcf->log_code.len, err, sizeof(err));
+  rc = handle.eval((const char *) slcf->log_code.data, slcf->log_code.len,
+      err, sizeof(err));
 
   if (rc == NGX_ERROR) {
     ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "[scheme]: %s", err);
@@ -457,8 +463,6 @@ ngx_http_scheme_log_handler(ngx_http_request_t *r)
 
   ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
       "[scheme]: log eval rc %i", (int) rc);
-
-  ngx_http_scheme_destroy(svm, r);
 
   return NGX_OK;
 }

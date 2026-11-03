@@ -11,16 +11,38 @@ A second host function, `ngx-log`, writes log messages to nginx's error log;
 `ngx-var-ref` reads nginx variables such as `remote_addr`.
 
 The module follows the classic nginx content-module layout (module struct +
-commands array + create/merge loc_conf + content handler).  It is a generic
-third-party nginx module; the host scheme interpreter is a separate project
-and is linked in as a dependency.
+commands array + create/merge loc_conf + phase handlers) as file-scope
+statics prefixed `ngx_http_scheme_`; the scheme bridge is a single C++ class
+(`NgxSchemeVMHandle`).  Only the `ngx_http_scheme_module` symbol that nginx
+looks up keeps external linkage and C linkage (nginx's generated module list
+references it by name).  It is a generic third-party nginx module; the host
+scheme interpreter is a separate project and is linked in as a dependency.
 
 Three directives are provided: `content_by_scheme` (content phase),
 `access_by_scheme` (access phase, for auth) and `log_by_scheme` (log phase,
 for request logging).  All three take inline Scheme source and all are
 compiled once per location.
 
+### Execution model
+
+- One Scheme VM per worker process, created lazily after the worker forks
+  and never destroyed.  Compiled location scripts and their sandbox
+  environments live in that VM.
+- Each phase handler creates a small per-request handle over that VM when it
+  runs and destroys the handle before returning.  The handle owns only the
+  `ngx-say` output buffer; response state lives in nginx's request.
+
 ### Build
+
+Recommended, builds nginx with the module (scheme core included) and runs it
+from `build-make/`:
+
+```sh
+cmake -S . -B build-make && cmake --build build-make
+./t/run.sh
+```
+
+Or build it as a regular add-on of an nginx source tree:
 
 ```sh
 SCHEME_CORE_DIR=/path/to/dummy \
